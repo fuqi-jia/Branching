@@ -10,8 +10,9 @@
 - **单步 reward**：一次 F-Split 分支后，由后续 ``Solve`` 得到的**局部最优值
   (incumbent) 提升**。MAX 时 ``reward = 新值 - 旧值``；MIN 时 ``reward = 旧值 - 新值``
   （越优 reward 越大）。见 :meth:`SolverInLoopRLTrainer._build_episode`。
-- **终局 loss/penalty**：整个 OMT 问题求解的 **wall-clock 运行时间**，作为负向终局
-  奖励（时间越长终局奖励越低），驱动策略更快到达最优。
+- **终局 loss/penalty**：整个 OMT 问题求解消耗的 **z3 rlimit count 增长**，作为负向
+  终局奖励（rlimit 是与硬件/负载无关的确定性工作量计量，比 wall-clock 更稳定可复现），
+  驱动策略以更少的求解开销到达最优。
 
 训练时先在无梯度下 rollout 采样动作并记录动作对应的图；更新时对记录的每个图重跑
 一次前向（图是固定输入，梯度只流向策略参数），按折扣回报做 REINFORCE，带移动平均
@@ -56,8 +57,8 @@ class RLConfig:
 
     # 奖励塑形
     reward_scale: float = 1.0        # incumbent 提升的缩放
-    time_penalty_coef: float = 1.0   # 终局运行时间 penalty 权重
-    use_log_time: bool = True        # True: 用 log(1+t) 压缩时间尺度
+    rlimit_penalty_coef: float = 1.0  # 终局 rlimit 代价 penalty 权重
+    use_log_cost: bool = True        # True: 用 log(1+rlimit) 压缩代价尺度
 
     # 求解回路
     max_steps: int = 10_000          # calculus 派生步数上限
@@ -81,8 +82,9 @@ class RLEpisode:
 
     steps: list[RLStep] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)  # 与 steps 对齐的单步 reward
-    terminal_reward: float = 0.0     # 运行时间导致的终局负向奖励
-    runtime: float = 0.0
+    terminal_reward: float = 0.0     # rlimit 代价导致的终局负向奖励
+    rlimit: int = 0                  # 本次求解累计的 z3 rlimit count
+    runtime: float = 0.0             # wall-clock（仅供参考/日志）
     final_value: Optional[float] = None
     optimal: bool = False
     result_stats: dict = field(default_factory=dict)
@@ -224,10 +226,11 @@ class SolverInLoopRLTrainer:
         t0 = time.perf_counter()
         result = solver.run()
         runtime = time.perf_counter() - t0
-        return self._build_episode(strategy.steps, result, sense, runtime)
+        return self._build_episode(strategy.steps, result, sense,
+                                   rlimit=backend.rlimit_count, runtime=runtime)
 
     def _build_episode(self, steps: list[RLStep], result: GOMTResult,
-                       sense: Sense, runtime: float) -> RLEpisode:
+                       sense: Sense, rlimit: int, runtime: float) -> RLEpisode:
         final_val = float(result.value) if result.value is not None else None
         sign = 1.0 if sense is Sense.MAX else -1.0  # 使“更优”对应正 reward
 
@@ -240,12 +243,14 @@ class SolverInLoopRLTrainer:
             else:
                 rewards.append(sign * (nxt - cur) * self.config.reward_scale)
 
-        t = math.log1p(runtime) if self.config.use_log_time else runtime
-        terminal = -self.config.time_penalty_coef * t
+        # 终局代价：用 z3 rlimit count 增长（替代 wall-clock）。
+        cost = math.log1p(rlimit) if self.config.use_log_cost else float(rlimit)
+        terminal = -self.config.rlimit_penalty_coef * cost
 
         return RLEpisode(
-            steps=steps, rewards=rewards, terminal_reward=terminal, runtime=runtime,
-            final_value=final_val, optimal=result.optimal, result_stats=dict(result.stats),
+            steps=steps, rewards=rewards, terminal_reward=terminal, rlimit=rlimit,
+            runtime=runtime, final_value=final_val, optimal=result.optimal,
+            result_stats=dict(result.stats),
         )
 
     # ------------------------------------------------------------------ #
@@ -335,8 +340,9 @@ class SolverInLoopRLTrainer:
                 ep = self.collect_episode(hard, obj, sense)
                 stats = self.update(ep)
                 stats.update({
-                    "iter": it, "instance": j, "runtime": ep.runtime,
-                    "final_value": ep.final_value, "optimal": ep.optimal,
+                    "iter": it, "instance": j, "rlimit": ep.rlimit,
+                    "runtime": ep.runtime, "final_value": ep.final_value,
+                    "optimal": ep.optimal,
                     "splits": ep.result_stats.get("splits", 0),
                     "solve_calls": ep.result_stats.get("solve_calls", 0),
                 })
@@ -345,14 +351,14 @@ class SolverInLoopRLTrainer:
                     print(
                         f"[iter {it} inst {j}] loss={stats['loss']:.4f} "
                         f"return={stats['mean_return']:.4f} baseline={stats['baseline']:.4f} "
-                        f"runtime={ep.runtime * 1e3:.1f}ms splits={stats['splits']} "
+                        f"rlimit={ep.rlimit} splits={stats['splits']} "
                         f"solve_calls={stats['solve_calls']} value={ep.final_value}"
                     )
         return history
 
     @torch.no_grad()
-    def evaluate(self, hard_list, objective, sense: Sense) -> tuple[GOMTResult, float]:
-        """确定性评估（argmax 策略），返回 ``(result, runtime_seconds)``。"""
+    def evaluate(self, hard_list, objective, sense: Sense) -> tuple[GOMTResult, int]:
+        """确定性评估（argmax 策略），返回 ``(result, rlimit_count)``。"""
         backend = Z3Backend()
         problem = GOMTProblem(hard_list=tuple(hard_list), objective=objective, sense=sense)
         strategy = RLRecordingStrategy(problem, self.policy, self.config, sample=False)
@@ -360,13 +366,60 @@ class SolverInLoopRLTrainer:
             problem, backend, strategy,
             GOMTConfig(max_steps=self.config.max_steps, f_sat_mode="plain"),
         )
-        t0 = time.perf_counter()
         result = solver.run()
-        return result, time.perf_counter() - t0
+        return result, backend.rlimit_count
 
     def make_service(self) -> BranchingPolicyService:
         """把当前策略包装成部署用的 :class:`BranchingPolicyService`。"""
         return BranchingPolicyService(policy=self.policy)
+
+    # ------------------------------------------------------------------ #
+    # 结果持久化
+    # ------------------------------------------------------------------ #
+    def save(self, path, history: Optional[list] = None) -> None:
+        """保存策略权重 + RL 训练状态（baseline / 配置 / 训练历史）。"""
+        from dataclasses import asdict
+
+        from omt_branching.model.persistence import save_policy
+
+        save_policy(self.policy, path, meta={
+            "kind": "rl",
+            "baseline": self._baseline,
+            "rl_config": asdict(self.config),
+            "history": history or [],
+        })
+
+    def load(self, path, map_location: Optional[str] = None) -> dict:
+        """从磁盘恢复策略权重与 RL 训练状态，返回附带的 meta。"""
+        from omt_branching.model.persistence import load_policy_into
+
+        meta = load_policy_into(self.policy, path, map_location or self.config.device)
+        self._baseline = float(meta.get("baseline", 0.0))
+        return meta
+
+
+def solve_and_measure(hard_list, objective, sense: Sense, strategy_factory,
+                      max_steps: int = 10_000, f_sat_mode: str = "plain") -> dict:
+    """用给定策略跑一次完整求解，返回代价/结果指标（含 rlimit）。
+
+    ``strategy_factory(problem) -> BranchingStrategy``，便于对同一实例分别评测
+    Neural 与 Baseline 策略。返回 dict 含 ``value / optimal / splits / solve_calls /
+    rlimit / steps``。
+    """
+    backend = Z3Backend()
+    problem = GOMTProblem(hard_list=tuple(hard_list), objective=objective, sense=sense)
+    strategy = strategy_factory(problem)
+    solver = GOMTSolver(problem, backend, strategy,
+                        GOMTConfig(max_steps=max_steps, f_sat_mode=f_sat_mode))
+    result = solver.run()
+    return {
+        "value": result.value,
+        "optimal": result.optimal,
+        "splits": result.stats.get("splits", 0),
+        "solve_calls": result.stats.get("solve_calls", 0),
+        "steps": result.stats.get("steps", 0),
+        "rlimit": backend.rlimit_count,
+    }
 
 
 def _categorical_entropy(probs: torch.Tensor) -> torch.Tensor:
@@ -385,4 +438,5 @@ __all__ = [
     "RLEpisode",
     "RLRecordingStrategy",
     "SolverInLoopRLTrainer",
+    "solve_and_measure",
 ]

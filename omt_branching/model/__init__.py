@@ -11,6 +11,13 @@ from omt_branching.model.policy import BranchingPolicy, PolicyConfig, PolicyOutp
 from omt_branching.model.trainer import ImitationTrainer, TrainConfig, RankingExample
 from omt_branching.model.finetune import SolverInLoopFinetuner, FinetuneConfig, Trajectory
 from omt_branching.model.inference import InferenceEngine, InferenceConfig
+from omt_branching.model.persistence import (
+    save_policy,
+    load_policy,
+    load_policy_into,
+    save_history,
+    load_history,
+)
 
 __all__ = [
     "HeteroEncoder",
@@ -29,4 +36,9 @@ __all__ = [
     "Trajectory",
     "InferenceEngine",
     "InferenceConfig",
+    "save_policy",
+    "load_policy",
+    "load_policy_into",
+    "save_history",
+    "load_history",
 ]

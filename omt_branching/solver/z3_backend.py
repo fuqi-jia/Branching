@@ -20,16 +20,30 @@ class Unbounded(Exception):
 
 
 class Z3Backend:
-    """以 z3 公开 API 实现的 ``SolveBackend``。"""
+    """以 z3 公开 API 实现的 ``SolveBackend``。
+
+    额外累计 z3 的 **rlimit count**（``Solver.statistics()`` 的 ``"rlimit count"``）
+    与 solve 次数：rlimit 是 z3 与硬件/负载无关的确定性工作量计量，用它的增长反映
+    “求解耗时”比 wall-clock 更稳定可复现，适合作强化学习的代价信号。
+    """
 
     def __init__(self, eps: float = 1e-9):
         self.eps = eps
+        self.rlimit_count = 0    # 累计 rlimit（跨本 backend 的所有 solve/optimize 调用）
+        self.solve_calls = 0     # 累计 check() 次数
+
+    def reset_stats(self) -> None:
+        """清零累计统计（复用同一 backend 跑多次时使用）。"""
+        self.rlimit_count = 0
+        self.solve_calls = 0
 
     # ---------------- 求解 ----------------
     def solve(self, constraint) -> Optional[z3.ModelRef]:
         s = z3.Solver()
         s.add(constraint)
-        return s.model() if s.check() == z3.sat else None
+        res = s.check()
+        self._accumulate(s)
+        return s.model() if res == z3.sat else None
 
     def optimize(self, constraint, objective, sense: Sense):
         o = z3.Optimize()
@@ -38,12 +52,26 @@ class Z3Backend:
             o.minimize(objective)
         else:
             o.maximize(objective)
-        if o.check() != z3.sat:
+        res = o.check()
+        self._accumulate(o)
+        if res != z3.sat:
             return None
         m = o.model()
         # 用最优 model 上的目标取值作为最优值（LIA/LRA 闭最优时即为 bound，
         # 且避免 lower/upper 返回 epsilon/oo 表达式带来的解析问题）。
         return m, self.value(m, objective)
+
+    def _accumulate(self, solver) -> None:
+        """把一次 check() 的 rlimit count 累加进 backend 统计。"""
+        self.solve_calls += 1
+        try:
+            st = solver.statistics()
+            for key in st.keys():
+                if key == "rlimit count":
+                    self.rlimit_count += int(st.get_key_value(key))
+                    break
+        except Exception:  # pragma: no cover - 统计缺失不应影响求解
+            pass
 
     # ---------------- 取值 ----------------
     def value(self, model, term):

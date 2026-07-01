@@ -1,0 +1,114 @@
+"""从 OMT 实例构造 GNN 监督（imitation）训练数据，并提供策略 top 选择查询。
+
+- :func:`build_imitation_examples`：对每个实例取**初始状态**的图快照，用启发式专家
+  （目标系数越大越该分支，见 :func:`~omt_branching.solver.instance_gen.oracle_numeric_choice`）
+  给数值候选打分，产出 :class:`RankingExample` 冷启动标签（plan 5.2 heuristic distillation）。
+- :func:`policy_numeric_choice`：在初始状态图上跑策略，返回其 top-1 数值分支变量 id，
+  用于评测“分支选择准确率”（与专家一致的比例）。
+
+均经 ``omt_branching.solver`` 的 adapter（Z3Backend / Z3SnapshotExtractor）与 z3 交互。
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Hashable, Optional
+
+from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
+from omt_branching.interfaces import NodeType
+from omt_branching.model.policy import BranchingPolicy
+from omt_branching.model.trainer import RankingExample
+from omt_branching.solver.extractor import Z3SnapshotExtractor
+from omt_branching.solver.instance_gen import OMTInstance
+from omt_branching.solver.problem import GOMTProblem
+from omt_branching.solver.z3_backend import Z3Backend
+
+
+def _initial_extraction(instance: OMTInstance):
+    """构造实例初始状态并抽取 (graph, extraction)；不可行返回 ``(None, None)``。"""
+    hard, obj, sense = instance.as_tuple()
+    backend = Z3Backend()
+    problem = GOMTProblem(hard_list=hard, objective=obj, sense=sense)
+    try:
+        state = problem.initial_state(backend)
+    except Exception:
+        return None, None
+    extractor = Z3SnapshotExtractor(problem)
+    view = replace(state, hard=backend.conjoin(state.hard, state.top))
+    extraction = extractor.extract(view, backend)
+    builder = GraphBuilder(DEFAULT_FEATURE_SPEC)
+    graph = builder.build(extraction.snapshot)
+    return graph, extraction
+
+
+def build_imitation_example(instance: OMTInstance) -> Optional[RankingExample]:
+    """把单个实例的初始图 + 启发式标签打包成一个 :class:`RankingExample`。"""
+    graph, extraction = _initial_extraction(instance)
+    if graph is None:
+        return None
+    nmap = graph.id_maps.get(NodeType.NUMERIC_VAR, {})
+    is_max = instance.sense.value == "max"
+
+    int_scores: dict[int, float] = {}
+    int_dirs: dict[int, bool] = {}
+    for nv in extraction.snapshot.numeric_vars:
+        local = nmap.get(nv.num_var_id)
+        if local is None:
+            continue
+        int_scores[local] = abs(nv.objective_coeff)
+        # 朝改善目标的方向 split：MAX 且正系数 -> 向上；MIN 且正系数 -> 向下。
+        int_dirs[local] = (nv.objective_coeff >= 0) == is_max
+    if not int_scores:
+        return None
+    return RankingExample(graph=graph, int_target_scores=int_scores,
+                          int_dir_targets=int_dirs)
+
+
+def build_imitation_examples(instances) -> list[RankingExample]:
+    """对一组实例批量构造 imitation 训练样本（跳过无数值候选/不可行者）。"""
+    out: list[RankingExample] = []
+    for inst in instances:
+        ex = build_imitation_example(inst)
+        if ex is not None:
+            out.append(ex)
+    return out
+
+
+def baseline_numeric_choice(instance: OMTInstance) -> Optional[Hashable]:
+    """复刻 :class:`BaselineStrategy` 的 root 选择（最大域跨度变量），用于准确率对比。"""
+    graph, extraction = _initial_extraction(instance)
+    if graph is None:
+        return None
+    best: Optional[Hashable] = None
+    best_span = 0.0
+    for handle in extraction.numeric_handles.values():
+        if handle.lower is None or handle.upper is None:
+            continue
+        span = handle.upper - handle.lower
+        if span >= 1 and span > best_span:
+            best, best_span = handle.var_id, span
+    return best
+
+
+def policy_numeric_choice(policy: BranchingPolicy,
+                          instance: OMTInstance) -> Optional[Hashable]:
+    """返回策略在初始状态选择的 top-1 数值分支变量 id（用于准确率评测）。"""
+    graph, extraction = _initial_extraction(instance)
+    if graph is None:
+        return None
+    out = policy.infer(graph)
+    probs = out.masked_numeric_probs()
+    if probs.numel() == 0 or not out.candidate_numeric_local:
+        return None
+    import torch
+
+    local = int(torch.argmax(probs).item())
+    return graph.solver_id(NodeType.NUMERIC_VAR, local)
+
+
+__all__ = [
+    "build_imitation_example",
+    "build_imitation_examples",
+    "policy_numeric_choice",
+    "baseline_numeric_choice",
+]

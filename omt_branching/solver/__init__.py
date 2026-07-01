@@ -26,6 +26,14 @@ from omt_branching.solver.strategy import (
 from omt_branching.solver.bridge import BridgeConfig, NeuralGOMTSolver, solve_native
 from omt_branching.solver.rl import (
     RLConfig, RLEpisode, RLRecordingStrategy, RLStep, SolverInLoopRLTrainer,
+    solve_and_measure,
+)
+from omt_branching.solver.instance_gen import (
+    OMTInstance, generate_dataset, generate_instance, oracle_numeric_choice,
+)
+from omt_branching.solver.training_data import (
+    build_imitation_example, build_imitation_examples, policy_numeric_choice,
+    baseline_numeric_choice,
 )
 
 __all__ = [
@@ -61,4 +69,15 @@ __all__ = [
     "RLEpisode",
     "RLStep",
     "RLRecordingStrategy",
+    "solve_and_measure",
+    # 实例生成
+    "OMTInstance",
+    "generate_instance",
+    "generate_dataset",
+    "oracle_numeric_choice",
+    # 训练数据
+    "build_imitation_example",
+    "build_imitation_examples",
+    "policy_numeric_choice",
+    "baseline_numeric_choice",
 ]
