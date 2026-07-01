@@ -23,6 +23,8 @@ ENV/
 # Experiments outputs
 experiments/results/
 
+examples/artifacts/
+
 # OS
 .DS_Store
 Thumbs.db
