@@ -6,17 +6,24 @@
   （``f_sat_mode="hybrid"`` 的叶子），因此**必须**用 hybrid 模式，否则 plain 线性搜索
   对实数不有限终止。
 - **有界 episode（anytime）**：GOMT 的增量式线性搜索对实数不有限饱和，故训练/评测都用
-  ``max_steps`` 预算；``optimal`` 常为 ``False``。真最优由 z3 原生 ``Optimize``
-  （:func:`solve_native`）给出，作为**最优性 gap** 的参照真值——不再断言“求得精确最优”。
-- **Baseline = 直接 Optimize**：``BaselineStrategy`` 对实数不二分 -> 在 hybrid 下根节点一次
-  ``resolve`` 即得全局最优（精确、开销极小）。这也说明：对 LRA，GNN 的价值不在于“比 z3
-  更快求全局最优”，而在于**布尔结构分支的取舍**；RL 的目标是学会**少做无益的 split**
-  （降低 rlimit 开销），并让数值 head 的排序贴近专家（准确率）。
+  ``max_steps`` 预算；``optimal`` 常为 ``False``。
+
+对比涉及**三档策略**：
+
+- **native(纯 z3)**：单次 z3 原生 ``Optimize``（z3 默认 OMT 策略）——一次
+  ``minimize/maximize`` + 一次 ``check()`` 直接得**精确最优**；作为 gap 参照真值与
+  **开销下界**（gap≡0、exact≡1）。见 :func:`native_measured`。
+- **baseline（GOMT 无分支）**：``BaselineStrategy`` 对实数不二分（0 splits），但仍走 GOMT
+  增量式回路——初始 ``Solve`` + 反复带**严格 Better 割**的 ``Optimize`` + F-Sat/F-Close。
+  对实数该严格割会触发 z3 ``Optimize`` 的 ε 逼近（分母渐增），预算内常不饱和（anytime）。
+  它**不是** z3 默认策略，开销显著高于 native。
+- **neural（GOMT + 学习分支）**：只在**布尔结构**上分支，连续部分交给 hybrid 叶子
+  ``Optimize``；RL 目标是让分支取舍在预算内取得更小 gap / 更低 rlimit。
 
 评测指标：
 1. **准确率**：数值 head top-1 与专家（``|目标系数|`` 最大）一致的比例（imitation 学习效果）。
-2. **开销/质量**：测试集上 Neural 与 Baseline 的平均 rlimit / solve_calls / splits，
-   以及**最优性 gap** ``|incumbent - native| / (|native|+eps)`` 与精确命中率。
+2. **开销/质量**：native / baseline / neural 的平均 rlimit / solve_calls / splits，以及
+   **最优性 gap** ``|incumbent - native| / (|native|+eps)`` 与精确命中率 exact。
 
 运行（默认 500/100，变量数 ≥10；耗时较长）::
 
@@ -42,13 +49,13 @@ from omt_branching.solver import (
     RLConfig,
     RLRecordingStrategy,
     SolverInLoopRLTrainer,
+    Z3Backend,
     baseline_numeric_choice,
     build_imitation_examples,
     generate_lra_dataset,
     oracle_numeric_choice,
     policy_numeric_choice,
     solve_and_measure,
-    solve_native,
 )
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
@@ -86,12 +93,30 @@ def _gap(value, native) -> float:
     return abs(fv - fn) / (abs(fn) + 1e-9)
 
 
+def native_measured(hard, obj, sense) -> dict:
+    """纯 z3 原生 OMT：单次 ``Optimize``（z3 默认求解策略），并计量其 rlimit/solve_calls。
+
+    与 GOMT 回路无关：一次 ``minimize/maximize`` + 一次 ``check()`` 直接得精确最优，
+    作为 ground truth 与开销下界参照。
+    """
+    backend = Z3Backend()
+    res = backend.optimize(backend.conjoin(*hard), obj, sense)
+    if res is None:
+        raise ValueError("native optimize: 硬约束不可满足")
+    return {"value": res[1], "optimal": True, "splits": 0,
+            "rlimit": backend.rlimit_count, "solve_calls": backend.solve_calls}
+
+
 def cost_comparison(policy, rl_config, instances, max_steps):
-    """在测试集上对比 Neural 与 Baseline 的开销与最优性 gap（hybrid, anytime）。"""
-    agg = {"neural": _fresh(), "baseline": _fresh()}
+    """对比 **native(纯 z3)** / **baseline(GOMT 无分支)** / **neural(GOMT+学习分支)**。
+
+    三者都以 native 的精确最优为 gap 参照（native 自身 gap≡0）。
+    """
+    agg = {"native": _fresh(), "neural": _fresh(), "baseline": _fresh()}
     for inst in instances:
         hard, obj, sense = inst.as_tuple()
-        native = solve_native(hard, obj, sense)
+        nat = native_measured(hard, obj, sense)
+        native = nat["value"]
 
         neural = solve_and_measure(
             hard, obj, sense,
@@ -102,6 +127,7 @@ def cost_comparison(policy, rl_config, instances, max_steps):
             hard, obj, sense, lambda p: BaselineStrategy(p),
             max_steps=max_steps, f_sat_mode=F_SAT_MODE)
 
+        _accumulate(agg["native"], nat, native)
         _accumulate(agg["neural"], neural, native)
         _accumulate(agg["baseline"], base, native)
     n = max(1, len(instances))
@@ -208,25 +234,27 @@ def main() -> None:
 
     agg = cost_comparison(reloaded, rl_config, test_set, args.max_steps)
     print("[开销/质量] 测试集平均（rlimit/solve_calls/splits/gap 越小越好，exact 越大越好）:")
-    print(f"  {'strategy':<10} {'rlimit':>12} {'solve_calls':>12} {'splits':>8} "
+    print(f"  {'strategy':<12} {'rlimit':>12} {'solve_calls':>12} {'splits':>8} "
           f"{'gap':>10} {'exact':>8}")
-    for name in ("neural", "baseline"):
+    labels = {"native": "native(z3)", "baseline": "baseline", "neural": "neural"}
+    for name in ("native", "baseline", "neural"):
         a = agg[name]
-        print(f"  {name:<10} {a['rlimit']:>12.1f} {a['solve_calls']:>12.2f} "
+        print(f"  {labels[name]:<12} {a['rlimit']:>12.1f} {a['solve_calls']:>12.2f} "
               f"{a['splits']:>8.2f} {a['gap']:>10.4f} {a['exact']:>8.2f}")
 
-    # LRA 说明：真最优（ground truth）由 z3 原生 Optimize（solve_native）给出。GOMT 的
-    # 增量式线性搜索（含 Baseline 的根节点 resolve）对实数用严格 Better 割会触发 z3
-    # Optimize 的 epsilon 逼近（分母渐增），在固定步数预算内一般不饱和（anytime），故不
-    # 断言精确最优；用最优性 gap 衡量质量。
+    # 三档参照：
+    # - native(z3)：单次原生 Optimize（z3 默认策略）——精确最优、开销下界，gap≡0、exact≡1。
+    # - baseline：GOMT 增量式（严格 Better 割 + 无分支）——对实数会 epsilon 逼近，anytime。
+    # - neural：GOMT + 学习到的布尔分支——同为 anytime，比较其相对 baseline 的收益。
+    print(f"\nnative(纯 z3) 为精确最优与开销下界参照；baseline/neural 为 GOMT 增量式(anytime)。")
     gn, gb = agg["neural"]["gap"], agg["baseline"]["gap"]
     rn, rb = agg["neural"]["rlimit"], agg["baseline"]["rlimit"]
-    print(f"\n对比（越低越好）: gap Neural={gn:.4f} vs Baseline={gb:.4f}；"
-          f"rlimit Neural={rn:.0f} vs Baseline={rb:.0f}")
+    print(f"Neural vs Baseline（越低越好）: gap {gn:.4f} vs {gb:.4f}；rlimit {rn:.0f} vs {rb:.0f}")
     verdict = "更优" if (gn <= gb and rn <= rb) else ("互有优劣" if gn <= gb or rn <= rb else "不及")
     print(f"结论：在该步数预算下，学习到的 Neural 策略相对 Baseline {verdict}"
-          "（gap 更小且/或 rlimit 更低即更优）。")
-    print("\nLRA 完整训练流程验证完成（anytime；ground truth = z3-native Optimize）。")
+          "（gap 更小且/或 rlimit 更低即更优）；两者开销普遍高于 native(z3)——"
+          "这正是 GOMT 分支框架相对纯理论优化的额外代价。")
+    print("\nLRA 完整训练流程验证完成（anytime；ground truth = native z3 Optimize）。")
 
 
 if __name__ == "__main__":
