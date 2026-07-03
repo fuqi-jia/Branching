@@ -29,7 +29,8 @@ from omt_branching.solver.rl import (
     solve_and_measure,
 )
 from omt_branching.solver.instance_gen import (
-    OMTInstance, generate_dataset, generate_instance, oracle_numeric_choice,
+    LRA_FAMILIES, OMTInstance, generate_dataset, generate_instance,
+    generate_lra_dataset, generate_lra_instance, oracle_numeric_choice,
 )
 from omt_branching.solver.training_data import (
     build_imitation_example, build_imitation_examples, policy_numeric_choice,
@@ -74,6 +75,9 @@ __all__ = [
     "OMTInstance",
     "generate_instance",
     "generate_dataset",
+    "generate_lra_instance",
+    "generate_lra_dataset",
+    "LRA_FAMILIES",
     "oracle_numeric_choice",
     # 训练数据
     "build_imitation_example",

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from typing import Optional
 
 from omt_branching.service import BranchingPolicyService
@@ -29,16 +30,34 @@ class StrategyConfig:
 
 
 def _numeric_split(handle: Handle, psi, backend, branch_up: bool) -> Optional[list]:
-    """对数值变量做域切分 ``x ≤ m`` ∨ ``x ≥ m+1``；不可分返回 ``None``。"""
+    """对数值变量做域切分；不可分返回 ``None``。
+
+    - **整数变量**：``x ≤ m`` ∨ ``x ≥ m+1``（间隙 ``(m, m+1)`` 不含整数，完备且 sound）。
+    - **实数变量**：``x ≤ q`` ∨ ``x ≥ q``（在有理中点 ``q`` 处闭重叠，覆盖全体实数，
+      对 LRA 同样 sound；若用整数式留间隙会漏掉 ``(m, m+1)`` 导致最优错误）。
+    """
     lo, up = handle.lower, handle.upper
-    if lo is None or up is None or up - lo < 1:
+    if lo is None or up is None:
         return None
-    m = int((lo + up) // 2)
-    m = max(int(lo), min(m, int(up) - 1))
-    if m < lo or m + 1 > up:
-        return None
-    low_branch = backend.conjoin(psi, backend.le(handle.z3_obj, m))
-    high_branch = backend.conjoin(psi, backend.ge(handle.z3_obj, m + 1))
+
+    if handle.is_integer:
+        if up - lo < 1:
+            return None
+        m = int((lo + up) // 2)
+        m = max(int(lo), min(m, int(up) - 1))
+        if m < lo or m + 1 > up:
+            return None
+        low_branch = backend.conjoin(psi, backend.le(handle.z3_obj, m))
+        high_branch = backend.conjoin(psi, backend.ge(handle.z3_obj, m + 1))
+    else:
+        if up - lo <= 1e-9:
+            return None
+        q = Fraction((lo + up) / 2.0).limit_denominator(10_000)
+        if not (lo < float(q) < up):  # 保证两侧都真正收紧
+            return None
+        low_branch = backend.conjoin(psi, backend.le(handle.z3_obj, q))
+        high_branch = backend.conjoin(psi, backend.ge(handle.z3_obj, q))
+
     return [high_branch, low_branch] if branch_up else [low_branch, high_branch]
 
 
@@ -78,11 +97,13 @@ class NeuralStrategy:
         psi = state.top
         subs: Optional[list] = None
 
-        # 主路径：数值域切分（LIA 的 B&B 分支）。
+        # 主路径：整数变量的域切分（B&B 分支）。实数变量不做域二分——连续域二分会
+        # 产生无界细分且非终止；LRA 的连续部分交给 z3 Optimize（resolve / hybrid），
+        # GNN 只负责布尔结构分支。
         split_advice = advice.integer_split
         if split_advice is not None:
             handle = extraction.numeric_handles.get(split_advice.num_var_id)
-            if handle is not None:
+            if handle is not None and handle.is_integer:
                 subs = _numeric_split(handle, psi, backend, split_advice.branch_up)
 
         # 退回：布尔原子切分。
@@ -126,7 +147,8 @@ class BaselineStrategy:
         best: Optional[Handle] = None
         best_span = 0.0
         for handle in extraction.numeric_handles.values():
-            if handle.lower is None or handle.upper is None:
+            # 只对整数变量做域二分（见 NeuralStrategy 注释）；实数交给 resolve/Optimize。
+            if not handle.is_integer or handle.lower is None or handle.upper is None:
                 continue
             span = handle.upper - handle.lower
             if span >= 1 and span > best_span:

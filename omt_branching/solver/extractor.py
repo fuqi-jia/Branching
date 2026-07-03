@@ -42,6 +42,7 @@ class Handle:
     current_value: Optional[float] = None
     lower: Optional[float] = None
     upper: Optional[float] = None
+    is_integer: bool = True          # 数值变量是否为整数（决定 split 是否可留间隙）
 
 
 @dataclass
@@ -117,13 +118,15 @@ class Z3SnapshotExtractor:
             val = float(backend.value(incumbent, expr)) if incumbent is not None else None
             lo = lowers.get(name)
             up = uppers.get(name)
+            is_int = bool(z3.is_int(expr))
             numeric_infos.append(NumericVarInfo(
-                num_var_id=name, is_integer=bool(z3.is_int(expr)), lp_value=val,
+                num_var_id=name, is_integer=is_int, lp_value=val,
                 lower_bound=lo, upper_bound=up, is_fractional=False,
                 objective_coeff=obj_coeffs.get(name, 0.0),
             ))
             numeric_handles[name] = Handle("numeric", expr, name,
-                                           current_value=val, lower=lo, upper=up)
+                                           current_value=val, lower=lo, upper=up,
+                                           is_integer=is_int)
 
         # 5) 布尔变量信息（原子抽象布尔 + 纯布尔常量）。
         bool_infos: list[BooleanVarInfo] = [
@@ -210,7 +213,9 @@ class Z3SnapshotExtractor:
         if z3.is_int_value(e):
             return {}, float(e.as_long())
         if z3.is_rational_value(e):
-            return {}, float(e.numerator_as_long()) / float(e.denominator_as_long())
+            # 用整数真除而非 float(num)/float(den)：当 z3 模型给出巨大分子/分母
+            # （LRA 可行模型/目标切分常见）时，前者不会溢出（商可表示即安全）。
+            return {}, e.numerator_as_long() / e.denominator_as_long()
         if z3.is_const(e) and e.decl().kind() == z3.Z3_OP_UNINTERPRETED:
             name = e.decl().name()
             var_exprs[name] = e

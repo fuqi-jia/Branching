@@ -99,10 +99,16 @@ class Z3Backend:
         return z3.BoolVal(True)
 
     def le(self, term, bound):
-        return term <= bound
+        return term <= self._coerce_bound(term, bound)
 
     def ge(self, term, bound):
-        return term >= bound
+        return term >= self._coerce_bound(term, bound)
+
+    def _coerce_bound(self, term, bound):
+        """把 python int/Fraction 的界转成与 ``term`` sort 匹配的 z3 常量。"""
+        if isinstance(bound, (int, Fraction)):
+            return self._mk_numeral(term, bound)
+        return bound
 
     # ---------------- 内部工具 ----------------
     def _num(self, ref):

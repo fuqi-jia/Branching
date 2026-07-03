@@ -32,13 +32,25 @@ import torch
 from omt_branching.graph.hetero_graph import HeteroGraph
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
 from omt_branching.interfaces import NodeType
-from omt_branching.model.policy import BranchingPolicy
+from omt_branching.model.policy import BranchingPolicy, _masked_softmax
 from omt_branching.service import BranchingPolicyService
 from omt_branching.solver.calculus import GOMTConfig, GOMTResult, GOMTSolver
 from omt_branching.solver.interfaces import Sense, SplitDecision
 from omt_branching.solver.problem import GOMTProblem
 from omt_branching.solver.strategy import _bool_split, _numeric_split
 from omt_branching.solver.z3_backend import Z3Backend
+
+
+def _integer_numeric_locals(graph: HeteroGraph, candidate_numeric_local) -> list[int]:
+    """从候选数值局部索引中筛出**整数变量**（NUMERIC_VAR 特征第 0 维 = is_integer）。
+
+    仅整数变量做域二分（B&B）；实数变量的连续优化交给 z3，故不作为域切分候选。
+    """
+    feats = graph.node_features.get(NodeType.NUMERIC_VAR)
+    if feats is None or feats.numel() == 0:
+        return []
+    return [c for c in candidate_numeric_local
+            if 0 <= c < feats.shape[0] and float(feats[c, 0]) >= 0.5]
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +75,7 @@ class RLConfig:
     # 求解回路
     max_steps: int = 10_000          # calculus 派生步数上限
     max_split_depth: int = 6         # 每个 Δ-round 的 split 预算（保证终止）
+    f_sat_mode: str = "plain"        # "plain"（LIA 首选）| "hybrid"（LRA 首选，Optimize 叶子，保证终止）
 
 
 @dataclass
@@ -132,7 +145,8 @@ class RLRecordingStrategy:
             warnings.warn(f"RLRecordingStrategy 抽取/推理失败，回退 resolve: {exc!r}")
             return SplitDecision.resolve()
 
-        action = self._select_action(out)
+        int_locals = _integer_numeric_locals(graph, out.candidate_numeric_local)
+        action = self._select_action(out, int_locals)
         if action is None:
             return SplitDecision.resolve()
         head, chosen_local, direction = action
@@ -162,10 +176,13 @@ class RLRecordingStrategy:
         return SplitDecision.split(subs, source="rl")
 
     # ------------------------------------------------------------------ #
-    def _select_action(self, out) -> Optional[tuple[str, int, bool]]:
-        """优先数值域切分（B&B / 整数 head），否则布尔原子切分。"""
-        num_probs = out.masked_numeric_probs()
-        if num_probs.numel() > 0 and out.candidate_numeric_local and float(num_probs.sum()) > 0:
+    def _select_action(self, out, int_locals) -> Optional[tuple[str, int, bool]]:
+        """优先整数域切分（B&B / 整数 head），否则布尔原子切分。
+
+        ``int_locals``：可做域二分的**整数**数值候选局部索引；实数候选被排除。
+        """
+        num_probs = _masked_softmax(out.int_branch_scores, int_locals)
+        if num_probs.numel() > 0 and int_locals and float(num_probs.sum()) > 0:
             idx = self._sample_index(num_probs)
             dir_p = float(torch.sigmoid(out.int_dir_logits[idx]))
             direction = self._sample_bool(dir_p)
@@ -221,7 +238,7 @@ class SolverInLoopRLTrainer:
         strategy = RLRecordingStrategy(problem, self.policy, self.config, sample=True)
         solver = GOMTSolver(
             problem, backend, strategy,
-            GOMTConfig(max_steps=self.config.max_steps, f_sat_mode="plain"),
+            GOMTConfig(max_steps=self.config.max_steps, f_sat_mode=self.config.f_sat_mode),
         )
         t0 = time.perf_counter()
         result = solver.run()
@@ -305,9 +322,14 @@ class SolverInLoopRLTrainer:
         return out
 
     def _action_logp_entropy(self, out, step: RLStep):
-        """重算所记录动作的对数似然与该步分布熵（selection + direction）。"""
+        """重算所记录动作的对数似然与该步分布熵（selection + direction）。
+
+        numeric head 使用与 rollout 一致的**整数受限**分布（见 ``_select_action``），
+        否则会因候选集合不一致导致对数似然与梯度错配。
+        """
         if step.head == "numeric":
-            probs = out.masked_numeric_probs()
+            int_locals = _integer_numeric_locals(step.graph, out.candidate_numeric_local)
+            probs = _masked_softmax(out.int_branch_scores, int_locals)
             dir_logits = out.int_dir_logits
         else:
             probs = out.masked_bool_probs()
@@ -364,7 +386,7 @@ class SolverInLoopRLTrainer:
         strategy = RLRecordingStrategy(problem, self.policy, self.config, sample=False)
         solver = GOMTSolver(
             problem, backend, strategy,
-            GOMTConfig(max_steps=self.config.max_steps, f_sat_mode="plain"),
+            GOMTConfig(max_steps=self.config.max_steps, f_sat_mode=self.config.f_sat_mode),
         )
         result = solver.run()
         return result, backend.rlimit_count
