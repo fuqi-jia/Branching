@@ -52,3 +52,26 @@ def test_baseline_for_unknown_key_falls_back_to_global():
     tr._baseline = -7.0
     assert tr._baseline_for("never-seen") == -7.0
     assert tr._baseline_for(None) == -7.0
+
+
+def test_saturation_bonus_rewards_optimal_episode():
+    from omt_branching.solver.calculus import GOMTResult
+
+    tr = _trainer(saturation_bonus=10.0, use_log_cost=True, rlimit_penalty_coef=1.0)
+    opt = GOMTResult(model=None, value=5.0, optimal=True, stats={})
+    non = GOMTResult(model=None, value=5.0, optimal=False, stats={})
+    ep_opt = tr._build_episode([], opt, Sense.MAX, rlimit=1000, runtime=0.0)
+    ep_non = tr._build_episode([], non, Sense.MAX, rlimit=1000, runtime=0.0)
+    # 相同 rlimit 下，饱和 episode 的终局奖励高出 saturation_bonus
+    assert ep_opt.terminal_reward - ep_non.terminal_reward == pytest.approx(10.0)
+
+
+def test_saturation_bonus_default_zero_no_change():
+    from omt_branching.solver.calculus import GOMTResult
+
+    tr = _trainer(rlimit_penalty_coef=1.0)  # saturation_bonus 默认 0
+    opt = GOMTResult(model=None, value=5.0, optimal=True, stats={})
+    non = GOMTResult(model=None, value=5.0, optimal=False, stats={})
+    ep_opt = tr._build_episode([], opt, Sense.MAX, rlimit=1000, runtime=0.0)
+    ep_non = tr._build_episode([], non, Sense.MAX, rlimit=1000, runtime=0.0)
+    assert ep_opt.terminal_reward == pytest.approx(ep_non.terminal_reward)

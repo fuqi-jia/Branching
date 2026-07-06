@@ -71,6 +71,7 @@ class RLConfig:
     reward_scale: float = 1.0        # incumbent 提升的缩放
     rlimit_penalty_coef: float = 1.0  # 终局 rlimit 代价 penalty 权重
     use_log_cost: bool = True        # True: 用 log(1+rlimit) 压缩代价尺度
+    saturation_bonus: float = 0.0    # 终局到达饱和(optimal)时的正向奖励，抵消"分支换 gap 而失精确"
 
     # 求解回路
     max_steps: int = 10_000          # calculus 派生步数上限
@@ -256,6 +257,9 @@ class SolverInLoopRLTrainer:
         # 终局代价：用 z3 rlimit count 增长（替代 wall-clock）。
         cost = math.log1p(rlimit) if self.config.use_log_cost else float(rlimit)
         terminal = -self.config.rlimit_penalty_coef * cost
+        # 饱和奖励：到达最优(τ=∅)时给正向 bonus，抵消"分支消耗预算换 gap 而失精确饱和"。
+        if result.optimal:
+            terminal += self.config.saturation_bonus
 
         return RLEpisode(
             steps=steps, rewards=rewards, terminal_reward=terminal, rlimit=rlimit,
