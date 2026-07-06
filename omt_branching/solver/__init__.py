@@ -34,7 +34,10 @@ from omt_branching.solver.instance_gen import (
 )
 from omt_branching.solver.training_data import (
     build_imitation_example, build_imitation_examples, policy_numeric_choice,
-    baseline_numeric_choice,
+    baseline_numeric_choice, bool_branch_hit,
+)
+from omt_branching.solver.strong_branch import (
+    StrongBranchConfig, oracle_bool_choice, strong_branch_scores,
 )
 
 __all__ = [
@@ -84,4 +87,9 @@ __all__ = [
     "build_imitation_examples",
     "policy_numeric_choice",
     "baseline_numeric_choice",
+    "bool_branch_hit",
+    # strong-branching 布尔专家
+    "StrongBranchConfig",
+    "oracle_bool_choice",
+    "strong_branch_scores",
 ]
