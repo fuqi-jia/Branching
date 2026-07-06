@@ -73,16 +73,16 @@ class GOMTSolver:
                 st.step += 1
                 continue
 
-            # resolve（含空 split 的退化）：对当前 branch 调用 Solve / Optimize。
+            # resolve（含空 split 的退化）：对当前 branch 增量调用 Solve / Optimize
+            # （base=φ 断言一次，branch=ψ 经 push/pop 变化，保留 z3 lemma 大幅提速）。
             psi = st.top
-            branch = b.conjoin(st.hard, psi)
             st.stats["solve_calls"] += 1
             if self.config.f_sat_mode == "hybrid":
-                res = b.optimize(branch, obj, sense)
+                res = b.optimize_branch(st.hard, psi, obj, sense)
                 model = res[0] if res is not None else None
                 value = res[1] if res is not None else None
             else:
-                model = b.solve(branch)
+                model = b.solve_branch(st.hard, psi)
                 value = b.value(model, obj) if model is not None else None
 
             if model is not None:

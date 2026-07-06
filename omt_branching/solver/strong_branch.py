@@ -68,8 +68,8 @@ def strong_branch_scores(extraction, phi, objective, sense: Sense, backend: Z3Ba
         if handle is None:
             continue
         a = handle.z3_obj
-        ra = backend.optimize(backend.conjoin(phi, a), objective, sense)
-        rna = backend.optimize(backend.conjoin(phi, backend.negate(a)), objective, sense)
+        ra = backend.optimize_branch(phi, a, objective, sense)
+        rna = backend.optimize_branch(phi, backend.negate(a), objective, sense)
         if ra is None or rna is None:
             scores[bid] = 0.0
             continue
@@ -109,8 +109,8 @@ def _numeric_children(handle, phi, objective, sense: Sense, backend: Z3Backend):
     if m < lo or m + 1 > up:
         return None
     x = handle.z3_obj
-    r_lo = backend.optimize(backend.conjoin(phi, backend.le(x, m)), objective, sense)
-    r_hi = backend.optimize(backend.conjoin(phi, backend.ge(x, m + 1)), objective, sense)
+    r_lo = backend.optimize_branch(phi, backend.le(x, m), objective, sense)
+    r_hi = backend.optimize_branch(phi, backend.ge(x, m + 1), objective, sense)
     v_lo = None if r_lo is None else float(r_lo[1])
     v_hi = None if r_hi is None else float(r_hi[1])
     return v_lo, v_hi

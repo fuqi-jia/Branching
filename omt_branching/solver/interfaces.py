@@ -98,6 +98,15 @@ class SolveBackend(Protocol):
         """更强的 Solve：返回 branch 内对 ``objective`` 最优的 ``(model, value)``。"""
         ...
 
+    def solve_branch(self, base: Constraint, branch: Constraint) -> Optional[Model]:
+        """增量版 ``solve``：``base`` 固定、``branch`` 逐节点变化，语义同 ``solve(base∧branch)``。"""
+        ...
+
+    def optimize_branch(self, base: Constraint, branch: Constraint, objective: Term,
+                        sense: Sense) -> Optional[tuple[Model, Value]]:
+        """增量版 ``optimize``：语义同 ``optimize(base∧branch, objective, sense)``。"""
+        ...
+
     def value(self, model: Model, term: Term) -> Value:
         """求 ``term`` 在 ``model`` 下的取值。"""
         ...
