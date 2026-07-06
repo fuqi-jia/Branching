@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Hashable, Optional
 
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
@@ -25,30 +24,38 @@ from omt_branching.solver.z3_backend import Z3Backend
 
 
 def _initial_extraction(instance: OMTInstance):
-    """构造实例初始状态并抽取 (graph, extraction)；不可行返回 ``(None, None)``。"""
+    """构造实例根状态并从**原始 φ** 抽取 (graph, extraction, backend)；不可行返回 (None, None, None)。
+
+    从 ``state.hard``（原始 φ，不含 δ0 割）抽取，使布尔候选=结构原子，排除目标上界割。
+    """
     hard, obj, sense = instance.as_tuple()
     backend = Z3Backend()
     problem = GOMTProblem(hard_list=hard, objective=obj, sense=sense)
     try:
         state = problem.initial_state(backend)
     except Exception:
-        return None, None
+        return None, None, None
     extractor = Z3SnapshotExtractor(problem)
-    view = replace(state, hard=backend.conjoin(state.hard, state.top))
-    extraction = extractor.extract(view, backend)
+    extraction = extractor.extract(state, backend)
     builder = GraphBuilder(DEFAULT_FEATURE_SPEC)
     graph = builder.build(extraction.snapshot)
-    return graph, extraction
+    return graph, extraction, backend
 
 
-def build_imitation_example(instance: OMTInstance) -> Optional[RankingExample]:
-    """把单个实例的初始图 + 启发式标签打包成一个 :class:`RankingExample`。"""
-    graph, extraction = _initial_extraction(instance)
+def build_imitation_example(instance: OMTInstance,
+                            config: "StrongBranchConfig" = None) -> Optional[RankingExample]:
+    """把单实例根图打包成 :class:`RankingExample`：数值 head（LIA 保留）+ bool head
+    （strong-branching 专家，LRA 主路径）标签。"""
+    from omt_branching.solver.strong_branch import StrongBranchConfig, strong_branch_scores
+
+    cfg = config or StrongBranchConfig()
+    graph, extraction, backend = _initial_extraction(instance)
     if graph is None:
         return None
+
+    # --- 数值 head 标签（|目标系数|；LIA 兼容）---
     nmap = graph.id_maps.get(NodeType.NUMERIC_VAR, {})
     is_max = instance.sense.value == "max"
-
     int_scores: dict[int, float] = {}
     int_dirs: dict[int, bool] = {}
     for nv in extraction.snapshot.numeric_vars:
@@ -58,10 +65,27 @@ def build_imitation_example(instance: OMTInstance) -> Optional[RankingExample]:
         int_scores[local] = abs(nv.objective_coeff)
         # 朝改善目标的方向 split：MAX 且正系数 -> 向上；MIN 且正系数 -> 向下。
         int_dirs[local] = (nv.objective_coeff >= 0) == is_max
-    if not int_scores:
+
+    # --- bool head 标签（strong branching；LRA 主路径）---
+    hard, obj, sense = instance.as_tuple()
+    phi = backend.conjoin(*hard)
+    raw_scores, raw_phases = strong_branch_scores(extraction, phi, obj, sense, backend, cfg)
+    bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+    bool_scores: dict[int, float] = {}
+    phase_targets: dict[int, bool] = {}
+    for bid, sc in raw_scores.items():
+        local = bmap.get(bid)
+        if local is not None:
+            bool_scores[local] = sc
+    for bid, ph in raw_phases.items():
+        local = bmap.get(bid)
+        if local is not None:
+            phase_targets[local] = ph
+
+    if not int_scores and not bool_scores:
         return None
-    return RankingExample(graph=graph, int_target_scores=int_scores,
-                          int_dir_targets=int_dirs)
+    return RankingExample(graph=graph, int_target_scores=int_scores, int_dir_targets=int_dirs,
+                          bool_target_scores=bool_scores, phase_targets=phase_targets)
 
 
 def build_imitation_examples(instances) -> list[RankingExample]:
@@ -76,7 +100,7 @@ def build_imitation_examples(instances) -> list[RankingExample]:
 
 def baseline_numeric_choice(instance: OMTInstance) -> Optional[Hashable]:
     """复刻 :class:`BaselineStrategy` 的 root 选择（最大域跨度变量），用于准确率对比。"""
-    graph, extraction = _initial_extraction(instance)
+    graph, extraction, _ = _initial_extraction(instance)
     if graph is None:
         return None
     best: Optional[Hashable] = None
@@ -93,7 +117,7 @@ def baseline_numeric_choice(instance: OMTInstance) -> Optional[Hashable]:
 def policy_numeric_choice(policy: BranchingPolicy,
                           instance: OMTInstance) -> Optional[Hashable]:
     """返回策略在初始状态选择的 top-1 数值分支变量 id（用于准确率评测）。"""
-    graph, extraction = _initial_extraction(instance)
+    graph, extraction, _ = _initial_extraction(instance)
     if graph is None:
         return None
     out = policy.infer(graph)
@@ -106,9 +130,40 @@ def policy_numeric_choice(policy: BranchingPolicy,
     return graph.solver_id(NodeType.NUMERIC_VAR, local)
 
 
+def bool_branch_hit(policy: BranchingPolicy, instance: OMTInstance,
+                    config: "StrongBranchConfig" = None) -> Optional[bool]:
+    """在**同一根抽取**上比较策略 bool-head top-1 与 strong-branching 专家是否一致。
+
+    无有意义分离原子（专家空/全 0）或无 bool 候选时返回 ``None``（该实例不计入准确率）。
+    单次抽取保证专家与策略共享同一套原子 id，规避跨抽取 id 漂移。
+    """
+    import torch
+
+    from omt_branching.solver.strong_branch import StrongBranchConfig, strong_branch_scores
+
+    cfg = config or StrongBranchConfig()
+    graph, extraction, backend = _initial_extraction(instance)
+    if graph is None:
+        return None
+    hard, obj, sense = instance.as_tuple()
+    phi = backend.conjoin(*hard)
+    scores, _ = strong_branch_scores(extraction, phi, obj, sense, backend, cfg)
+    if not scores or max(scores.values()) <= cfg.eps:
+        return None
+    oracle_bid = max(scores, key=lambda k: scores[k])
+
+    out = policy.infer(graph)
+    probs = out.masked_bool_probs()
+    if probs.numel() == 0 or not out.candidate_bool_local:
+        return None
+    local = int(torch.argmax(probs).item())
+    return graph.solver_id(NodeType.BOOL_VAR, local) == oracle_bid
+
+
 __all__ = [
     "build_imitation_example",
     "build_imitation_examples",
     "policy_numeric_choice",
     "baseline_numeric_choice",
+    "bool_branch_hit",
 ]
