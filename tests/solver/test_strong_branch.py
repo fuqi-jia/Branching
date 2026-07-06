@@ -47,3 +47,30 @@ def test_oracle_none_when_no_separation():
     inst = OMTInstance(instance_id="flat", variables=[x], hard=hard, objective=x,
                        sense=Sense.MAX, obj_coeffs={"x": 1.0}, theory="LRA")
     assert oracle_bool_choice(inst) is None
+
+
+from omt_branching.solver.strong_branch import (
+    strong_branch_numeric_scores, oracle_numeric_choice_sb,
+)
+
+
+def _lia_obj_instance():
+    """maximize x；x,y∈[0,10]，无耦合。x 影响目标(分离~10)，y 不影响(分离 0)。"""
+    x, y = z3.Int("x"), z3.Int("y")
+    hard = [x >= 0, x <= 10, y >= 0, y <= 10]
+    return OMTInstance(instance_id="li", variables=[x, y], hard=hard, objective=x,
+                       sense=Sense.MAX, obj_coeffs={"x": 1.0, "y": 0.0}, theory="LIA")
+
+
+def test_numeric_expert_ranks_objective_var_above_irrelevant():
+    inst = _lia_obj_instance()
+    extraction, phi, obj, sense, backend = _root_extraction(inst)
+    scores, dirs = strong_branch_numeric_scores(extraction, phi, obj, sense, backend)
+    assert scores.get("x", 0) > scores.get("y", 0)     # x 分离目标，y 不
+    # 选 x 后 MAX 应先探高侧（x 越大越优）
+    assert dirs["x"] is True
+
+
+def test_oracle_numeric_choice_sb_picks_objective_var():
+    inst = _lia_obj_instance()
+    assert oracle_numeric_choice_sb(inst) == "x"

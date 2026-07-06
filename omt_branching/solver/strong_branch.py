@@ -96,4 +96,71 @@ def oracle_bool_choice(instance: OMTInstance,
     return best if scores[best] > config.eps else None
 
 
-__all__ = ["StrongBranchConfig", "strong_branch_scores", "oracle_bool_choice"]
+_SENTINEL = 1e18  # 一侧 UNSAT：整数域切分直接剪半，记大分（有效分支）
+
+
+def _numeric_children(handle, phi, objective, sense: Sense, backend: Z3Backend):
+    """整数变量中点切分的两子最优 (v_lo, v_hi)；不可分返回 None，某侧 UNSAT 记 None。"""
+    lo, up = handle.lower, handle.upper
+    if lo is None or up is None or up - lo < 1:
+        return None
+    m = int((lo + up) // 2)
+    m = max(int(lo), min(m, int(up) - 1))
+    if m < lo or m + 1 > up:
+        return None
+    x = handle.z3_obj
+    r_lo = backend.optimize(backend.conjoin(phi, backend.le(x, m)), objective, sense)
+    r_hi = backend.optimize(backend.conjoin(phi, backend.ge(x, m + 1)), objective, sense)
+    v_lo = None if r_lo is None else float(r_lo[1])
+    v_hi = None if r_hi is None else float(r_hi[1])
+    return v_lo, v_hi
+
+
+def strong_branch_numeric_scores(extraction, phi, objective, sense: Sense, backend: Z3Backend,
+                                 config: StrongBranchConfig = StrongBranchConfig()):
+    """整数变量 strong branching（objective-separation）。返回 (scores, dirs) 按 var_id。
+
+    - 两侧可行：``score = |v_lo − v_hi|``（最能把可达目标分到两侧的变量最该分支）。
+    - 恰一侧 UNSAT：``score = SENT``（整数域切分剪掉半个域，有效）。
+    - ``dirs[var]``：先探保留更优目标的一侧（MAX→v_hi≥v_lo 则 branch_up=True）。
+    """
+    obj_coeffs = extraction.snapshot.objective.var_coeffs
+    handles = [h for h in extraction.numeric_handles.values() if h.is_integer]
+    handles.sort(key=lambda h: abs(obj_coeffs.get(h.var_id, 0.0)), reverse=True)
+
+    scores: dict = {}
+    dirs: dict = {}
+    for h in handles[: config.max_atoms]:
+        res = _numeric_children(h, phi, objective, sense, backend)
+        if res is None:
+            continue
+        v_lo, v_hi = res
+        if v_lo is None and v_hi is None:
+            continue
+        if v_lo is None or v_hi is None:
+            scores[h.var_id] = _SENTINEL
+            dirs[h.var_id] = (v_hi is not None)  # 可行侧优先
+            continue
+        scores[h.var_id] = abs(v_lo - v_hi)
+        dirs[h.var_id] = (v_hi >= v_lo) if sense is Sense.MAX else (v_hi <= v_lo)
+    return scores, dirs
+
+
+def oracle_numeric_choice_sb(instance: OMTInstance,
+                             config: StrongBranchConfig = StrongBranchConfig()):
+    """整数 strong-branching 专家选择：目标分离度最大的整数变量 var_id；无有意义分支返回 None。"""
+    try:
+        extraction, phi, obj, sense, backend = _root_extraction(instance)
+    except Exception:
+        return None
+    scores, _ = strong_branch_numeric_scores(extraction, phi, obj, sense, backend, config)
+    if not scores:
+        return None
+    best = max(scores, key=lambda k: scores[k])
+    return best if scores[best] > config.eps else None
+
+
+__all__ = [
+    "StrongBranchConfig", "strong_branch_scores", "oracle_bool_choice",
+    "strong_branch_numeric_scores", "oracle_numeric_choice_sb",
+]
