@@ -49,12 +49,11 @@ from omt_branching.solver import (
     RLConfig,
     RLRecordingStrategy,
     SolverInLoopRLTrainer,
+    StrongBranchConfig,
     Z3Backend,
-    baseline_numeric_choice,
+    bool_branch_hit,
     build_imitation_examples,
     generate_lra_dataset,
-    oracle_numeric_choice,
-    policy_numeric_choice,
     solve_and_measure,
 )
 
@@ -67,21 +66,21 @@ HISTORY_JSON = os.path.join(ARTIFACTS, "rl_lra_history.json")
 F_SAT_MODE = "hybrid"
 
 
-def branch_accuracy(policy, instances) -> tuple[float, float]:
-    """返回 (Neural 数值 head top-1 与专家一致比例, Baseline 与专家一致比例)。"""
-    neural_hit = base_hit = total = 0
+def branch_accuracy(policy, instances, config=None) -> tuple[float, int]:
+    """Neural bool-head top-1 与 strong-branching 专家一致的比例，及有效实例数。
+
+    只量**实际驱动 LRA 求解的 bool head**：对每个实例在同一根抽取上比较策略 argmax 原子与
+    strong-branching 专家选择；无有意义分离原子/无 bool 候选的实例不计入。
+    """
+    cfg = config or StrongBranchConfig()
+    hit = total = 0
     for inst in instances:
-        oracle = oracle_numeric_choice(inst)
-        if oracle is None:
+        r = bool_branch_hit(policy, inst, cfg)
+        if r is None:
             continue
         total += 1
-        if policy_numeric_choice(policy, inst) == oracle:
-            neural_hit += 1
-        if baseline_numeric_choice(inst) == oracle:
-            base_hit += 1
-    if total == 0:
-        return 0.0, 0.0
-    return neural_hit / total, base_hit / total
+        hit += 1 if r else 0
+    return (hit / total if total else 0.0), total
 
 
 def _gap(value, native) -> float:
@@ -156,7 +155,7 @@ def main() -> None:
     parser.add_argument("--test", type=int, default=100, help="测试集规模")
     parser.add_argument("--min-vars", type=int, default=10, help="最小变量数(>=10)")
     parser.add_argument("--max-vars", type=int, default=14, help="最大变量数")
-    parser.add_argument("--iters", type=int, default=1, help="RL 训练轮数")
+    parser.add_argument("--iters", type=int, default=3, help="RL 训练轮数")
     parser.add_argument("--epochs", type=int, default=30, help="imitation 轮数")
     parser.add_argument("--max-steps", type=int, default=80, help="每个 episode 的步数预算")
     parser.add_argument("--split-depth", type=int, default=3, help="每 Δ-round 的 split 预算")
@@ -179,15 +178,14 @@ def main() -> None:
           f"(vars {args.min_vars}..{args.max_vars})")
     for inst in test_set[:3]:
         print(f"  {inst.instance_id}: family={inst.family} vars={len(inst.variables)} "
-              f"hard={len(inst.hard)} sense={inst.sense.value} "
-              f"oracle={oracle_numeric_choice(inst)}")
+              f"hard={len(inst.hard)} sense={inst.sense.value}")
     print("  ...")
 
     # ---------------- 2) GNN 监督训练 + 保权 ----------------
     print("\n=== 2) GNN 监督训练 (imitation 冷启动) ===")
     policy = BranchingPolicy()
-    acc_before, base_acc = branch_accuracy(policy, test_set)
-    print(f"训练前 数值分支准确率: Neural={acc_before:.2f}  Baseline={base_acc:.2f}")
+    acc_before, n_valid = branch_accuracy(policy, test_set)
+    print(f"训练前 bool 分支准确率(vs strong-branching 专家): {acc_before:.2f} (有效 {n_valid} 例)")
 
     examples = build_imitation_examples(train_set)
     print(f"imitation 样本数: {len(examples)}")
@@ -197,7 +195,7 @@ def main() -> None:
           f"末轮 {history_imit[-1]['loss']:.4f}")
 
     acc_after, _ = branch_accuracy(policy, test_set)
-    print(f"训练后 数值分支准确率: Neural={acc_after:.2f}  Baseline={base_acc:.2f}")
+    print(f"训练后 bool 分支准确率: {acc_after:.2f}")
 
     save_policy(policy, GNN_CKPT, meta={"stage": "imitation", "theory": "LRA",
                                         "epochs": args.epochs})
@@ -207,7 +205,7 @@ def main() -> None:
     print("\n=== 3) Solver-in-the-Loop 强化学习 (REINFORCE, rlimit 代价, hybrid) ===")
     rl_config = RLConfig(
         lr=1e-3, gamma=0.98, entropy_coef=5e-3,
-        rlimit_penalty_coef=1.0, use_log_cost=True, reward_scale=0.1,
+        rlimit_penalty_coef=1.0, use_log_cost=True, reward_scale=1.0,
         max_split_depth=args.split_depth, max_steps=args.max_steps,
         f_sat_mode=F_SAT_MODE,
     )
@@ -229,8 +227,8 @@ def main() -> None:
 
     # ---------------- 4) 测试：准确率 + 开销/gap 对比 ----------------
     print("\n=== 4) 测试集对比 (Neural vs Baseline, hybrid/anytime) ===")
-    acc_neural, acc_base = branch_accuracy(reloaded, test_set)
-    print(f"[准确率] 数值 head top-1 与专家一致: Neural={acc_neural:.2f}  Baseline={acc_base:.2f}")
+    acc_neural, n_valid = branch_accuracy(reloaded, test_set)
+    print(f"[准确率] bool-head top-1 与 strong-branching 专家一致: {acc_neural:.2f} (有效 {n_valid} 例)")
 
     agg = cost_comparison(reloaded, rl_config, test_set, args.max_steps)
     print("[开销/质量] 测试集平均（rlimit/solve_calls/splits/gap 越小越好，exact 越大越好）:")

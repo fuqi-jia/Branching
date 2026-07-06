@@ -76,6 +76,7 @@ class RLConfig:
     max_steps: int = 10_000          # calculus 派生步数上限
     max_split_depth: int = 6         # 每个 Δ-round 的 split 预算（保证终止）
     f_sat_mode: str = "plain"        # "plain"（LIA 首选）| "hybrid"（LRA 首选，Optimize 叶子，保证终止）
+    eps: float = 1e-9                # 数值下限（reward 归一化除零保护）
 
 
 @dataclass
@@ -228,6 +229,7 @@ class SolverInLoopRLTrainer:
         self.config = config
         self.opt = torch.optim.Adam(policy.parameters(), lr=config.lr)
         self._baseline = 0.0
+        self._baselines: dict = {}   # 实例键 -> 移动平均 baseline（去除实例间代价方差）
 
     # ------------------------------------------------------------------ #
     # 采集：跑一次真实求解，记录轨迹并算奖励
@@ -249,16 +251,7 @@ class SolverInLoopRLTrainer:
     def _build_episode(self, steps: list[RLStep], result: GOMTResult,
                        sense: Sense, rlimit: int, runtime: float) -> RLEpisode:
         final_val = float(result.value) if result.value is not None else None
-        sign = 1.0 if sense is Sense.MAX else -1.0  # 使“更优”对应正 reward
-
-        rewards: list[float] = []
-        for i, step in enumerate(steps):
-            nxt = steps[i + 1].value_at_decision if i + 1 < len(steps) else final_val
-            cur = step.value_at_decision
-            if cur is None or nxt is None:
-                rewards.append(0.0)
-            else:
-                rewards.append(sign * (nxt - cur) * self.config.reward_scale)
+        rewards = self._shaped_rewards(steps, final_val, sense)
 
         # 终局代价：用 z3 rlimit count 增长（替代 wall-clock）。
         cost = math.log1p(rlimit) if self.config.use_log_cost else float(rlimit)
@@ -271,12 +264,49 @@ class SolverInLoopRLTrainer:
         )
 
     # ------------------------------------------------------------------ #
+    # baseline 与 reward 塑形
+    # ------------------------------------------------------------------ #
+    def _baseline_for(self, key) -> float:
+        """取该实例键的 baseline；未见过或 key=None 时回退全局。"""
+        if key is None:
+            return self._baseline
+        return self._baselines.get(key, self._baseline)
+
+    def _update_baseline_for(self, key, value: float) -> None:
+        """按动量 EMA 更新 baseline；首次见到某键以其回报初始化（避免全局污染）。"""
+        m = self.config.baseline_momentum
+        if key is None:
+            self._baseline = m * self._baseline + (1 - m) * value
+        elif key in self._baselines:
+            self._baselines[key] = m * self._baselines[key] + (1 - m) * value
+        else:
+            self._baselines[key] = value
+
+    def _shaped_rewards(self, steps: list, final_val, sense: Sense) -> list[float]:
+        """逐步 incumbent 提升，按 episode 内目标幅度归一到 O(1)；幅度为 0 则全 0。"""
+        sign = 1.0 if sense is Sense.MAX else -1.0
+        known = [s.value_at_decision for s in steps if s.value_at_decision is not None]
+        if final_val is not None:
+            known.append(final_val)
+        span = (max(known) - min(known)) if len(known) >= 2 else 0.0
+        scale = (self.config.reward_scale / span) if span > self.config.eps else 0.0
+        rewards: list[float] = []
+        for i, step in enumerate(steps):
+            nxt = steps[i + 1].value_at_decision if i + 1 < len(steps) else final_val
+            cur = step.value_at_decision
+            if cur is None or nxt is None or scale == 0.0:
+                rewards.append(0.0)
+            else:
+                rewards.append(sign * (nxt - cur) * scale)
+        return rewards
+
+    # ------------------------------------------------------------------ #
     # 更新：REINFORCE
     # ------------------------------------------------------------------ #
-    def update(self, episode: RLEpisode) -> dict[str, float]:
+    def update(self, episode: RLEpisode, key=None) -> dict[str, float]:
         if not episode.steps:
             return {"loss": 0.0, "mean_return": episode.terminal_reward,
-                    "baseline": self._baseline, "steps": 0}
+                    "baseline": self._baseline_for(key), "steps": 0}
 
         self.policy.train()
         dev = self.config.device
@@ -291,14 +321,14 @@ class SolverInLoopRLTrainer:
             logp, ent = self._action_logp_entropy(out, step)
             if logp is None:
                 continue
-            advantage = G - self._baseline
+            advantage = G - self._baseline_for(key)
             policy_loss = policy_loss - logp * advantage
             entropy = entropy + ent
             n += 1
 
         if n == 0:
             return {"loss": 0.0, "mean_return": float(sum(returns) / len(returns)),
-                    "baseline": self._baseline, "steps": 0}
+                    "baseline": self._baseline_for(key), "steps": 0}
 
         loss = (policy_loss - self.config.entropy_coef * entropy) / n
         self.opt.zero_grad()
@@ -307,10 +337,9 @@ class SolverInLoopRLTrainer:
         self.opt.step()
 
         mean_return = float(sum(returns) / len(returns))
-        m = self.config.baseline_momentum
-        self._baseline = m * self._baseline + (1 - m) * mean_return
+        self._update_baseline_for(key, mean_return)
         return {"loss": float(loss), "mean_return": mean_return,
-                "baseline": self._baseline, "steps": n}
+                "baseline": self._baseline_for(key), "steps": n}
 
     def _discounted_returns(self, ep: RLEpisode) -> list[float]:
         out: list[float] = []
@@ -360,7 +389,7 @@ class SolverInLoopRLTrainer:
         for it in range(iterations):
             for j, (hard, obj, sense) in enumerate(instances):
                 ep = self.collect_episode(hard, obj, sense)
-                stats = self.update(ep)
+                stats = self.update(ep, key=j)
                 stats.update({
                     "iter": it, "instance": j, "rlimit": ep.rlimit,
                     "runtime": ep.runtime, "final_value": ep.final_value,
