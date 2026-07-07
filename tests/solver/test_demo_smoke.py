@@ -26,3 +26,14 @@ def test_rl_lra_smoke_reports_bool_accuracy():
     )
     assert out.returncode == 0, out.stderr
     assert "bool 分支准确率" in out.stdout or "bool-head" in out.stdout
+
+
+def test_lia_branch_smoke_reaches_native():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.lia_branch",
+         "--train", "6", "--test", "6", "--min-vars", "4", "--max-vars", "4",
+         "--iters", "1", "--epochs", "3", "--max-steps", "300"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "搜索规模" in out.stdout

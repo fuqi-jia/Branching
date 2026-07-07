@@ -21,7 +21,7 @@ from omt_branching.solver.calculus import GOMTConfig, GOMTResult, GOMTSolver
 from omt_branching.solver.z3_backend import Unbounded, Z3Backend
 from omt_branching.solver.extractor import Extraction, Handle, Z3SnapshotExtractor
 from omt_branching.solver.strategy import (
-    BaselineStrategy, NeuralStrategy, StrategyConfig,
+    BaselineStrategy, NeuralStrategy, NumericHeuristicStrategy, StrategyConfig,
 )
 from omt_branching.solver.bridge import BridgeConfig, NeuralGOMTSolver, solve_native
 from omt_branching.solver.rl import (
@@ -29,15 +29,17 @@ from omt_branching.solver.rl import (
     solve_and_measure,
 )
 from omt_branching.solver.instance_gen import (
-    LRA_FAMILIES, OMTInstance, generate_dataset, generate_instance,
-    generate_lra_dataset, generate_lra_instance, oracle_numeric_choice,
+    LRA_FAMILIES, OMTInstance, generate_dataset, generate_hard_lia_dataset,
+    generate_hard_lia_instance, generate_instance, generate_lra_dataset,
+    generate_lra_instance, oracle_numeric_choice,
 )
 from omt_branching.solver.training_data import (
     build_imitation_example, build_imitation_examples, policy_numeric_choice,
     baseline_numeric_choice, bool_branch_hit,
 )
 from omt_branching.solver.strong_branch import (
-    StrongBranchConfig, oracle_bool_choice, strong_branch_scores,
+    StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
+    strong_branch_numeric_scores, strong_branch_scores,
 )
 
 __all__ = [
@@ -62,6 +64,7 @@ __all__ = [
     # 策略
     "NeuralStrategy",
     "BaselineStrategy",
+    "NumericHeuristicStrategy",
     "StrategyConfig",
     # 门面
     "NeuralGOMTSolver",
@@ -80,6 +83,8 @@ __all__ = [
     "generate_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
+    "generate_hard_lia_instance",
+    "generate_hard_lia_dataset",
     "LRA_FAMILIES",
     "oracle_numeric_choice",
     # 训练数据
@@ -88,8 +93,10 @@ __all__ = [
     "policy_numeric_choice",
     "baseline_numeric_choice",
     "bool_branch_hit",
-    # strong-branching 布尔专家
+    # strong-branching 专家
     "StrongBranchConfig",
     "oracle_bool_choice",
     "strong_branch_scores",
+    "oracle_numeric_choice_sb",
+    "strong_branch_numeric_scores",
 ]
