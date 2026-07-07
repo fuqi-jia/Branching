@@ -56,3 +56,22 @@ def test_imitation_trains_bool_head_loss_decreases():
     # bool head 有被训练：'branch' 损失项出现，且末轮 < 首轮
     assert "branch" in hist[0], "bool branching 损失项应存在（bool head 有梯度）"
     assert hist[-1]["branch"] < hist[0]["branch"]
+
+
+def test_imitation_numeric_strong_labels():
+    from omt_branching.solver.instance_gen import generate_hard_lia_dataset
+    from omt_branching.solver.training_data import build_imitation_example
+
+    ds = generate_hard_lia_dataset(8, seed=2, min_vars=5, max_vars=6)
+    ex = None
+    for inst in ds:
+        e = build_imitation_example(inst, numeric_expert="strong")
+        if e is not None and e.int_target_scores:
+            ex = e
+            break
+    assert ex is not None, "应有含数值 strong 标签的样本"
+    from omt_branching.interfaces import NodeType
+    n_num = ex.graph.num_nodes(NodeType.NUMERIC_VAR)
+    assert all(0 <= k < n_num for k in ex.int_target_scores)
+    # 数值方向标签也应存在
+    assert ex.int_dir_targets

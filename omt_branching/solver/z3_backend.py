@@ -31,18 +31,28 @@ class Z3Backend:
         self.eps = eps
         self.rlimit_count = 0    # 累计 rlimit（跨本 backend 的所有 solve/optimize 调用）
         self.solve_calls = 0     # 累计 check() 次数
+        # 增量求解：持久的 solver/optimizer（base=φ 断言一次，branch=ψ 经 push/pop 逐节点变化）。
+        self._inc_solver = None
+        self._inc_solver_base = None
+        self._inc_solver_rl = 0          # 该持久 solver 上次见到的累计 rlimit（用于取增量）
+        self._inc_opt = None
+        self._inc_opt_base = None
+        self._inc_opt_obj = None
+        self._inc_opt_sense = None
+        self._inc_opt_rl = 0
 
     def reset_stats(self) -> None:
         """清零累计统计（复用同一 backend 跑多次时使用）。"""
         self.rlimit_count = 0
         self.solve_calls = 0
 
-    # ---------------- 求解 ----------------
+    # ---------------- 求解（一次性：native / 初始态）----------------
     def solve(self, constraint) -> Optional[z3.ModelRef]:
         s = z3.Solver()
         s.add(constraint)
         res = s.check()
-        self._accumulate(s)
+        self.solve_calls += 1
+        self.rlimit_count += self._rlimit(s)
         return s.model() if res == z3.sat else None
 
     def optimize(self, constraint, objective, sense: Sense):
@@ -53,7 +63,8 @@ class Z3Backend:
         else:
             o.maximize(objective)
         res = o.check()
-        self._accumulate(o)
+        self.solve_calls += 1
+        self.rlimit_count += self._rlimit(o)
         if res != z3.sat:
             return None
         m = o.model()
@@ -61,17 +72,76 @@ class Z3Backend:
         # 且避免 lower/upper 返回 epsilon/oo 表达式带来的解析问题）。
         return m, self.value(m, objective)
 
-    def _accumulate(self, solver) -> None:
-        """把一次 check() 的 rlimit count 累加进 backend 统计。"""
+    # ---------------- 增量求解（GOMT 热回路 / strong-branching 标签）----------------
+    def solve_branch(self, base, branch) -> Optional[z3.ModelRef]:
+        """增量 ``Solve(base∧branch)``：``base`` 固定断言一次，``branch`` 经 push/pop 变化。
+
+        复用持久 solver 保留 z3 已学到的 lemma，避免每个 GOMT 节点从零重解 φ。
+        z3 模型取得后即使 pop / 再 check 仍有效（快照语义），可安全存作 incumbent。
+        """
+        s = self._inc_solver
+        if s is None or self._inc_solver_base is not base:
+            s = z3.Solver()
+            s.add(base)
+            self._inc_solver = s
+            self._inc_solver_base = base
+            self._inc_solver_rl = 0
+        s.push()
+        s.add(branch)
+        res = s.check()
+        model = s.model() if res == z3.sat else None
+        s.pop()
         self.solve_calls += 1
+        self._inc_solver_rl = self._accumulate_delta(s, self._inc_solver_rl)
+        return model
+
+    def optimize_branch(self, base, branch, objective, sense: Sense):
+        """增量 ``Optimize(base∧branch)``：``base``+目标断言一次，``branch`` 经 push/pop 变化。"""
+        o = self._inc_opt
+        if (o is None or self._inc_opt_base is not base
+                or self._inc_opt_obj is not objective or self._inc_opt_sense is not sense):
+            o = z3.Optimize()
+            o.add(base)
+            if sense is Sense.MIN:
+                o.minimize(objective)
+            else:
+                o.maximize(objective)
+            self._inc_opt = o
+            self._inc_opt_base = base
+            self._inc_opt_obj = objective
+            self._inc_opt_sense = sense
+            self._inc_opt_rl = 0
+        o.push()
+        o.add(branch)
+        res = o.check()
+        if res != z3.sat:
+            o.pop()
+            self.solve_calls += 1
+            self._inc_opt_rl = self._accumulate_delta(o, self._inc_opt_rl)
+            return None
+        m = o.model()
+        val = self.value(m, objective)
+        o.pop()
+        self.solve_calls += 1
+        self._inc_opt_rl = self._accumulate_delta(o, self._inc_opt_rl)
+        return m, val
+
+    def _rlimit(self, solver) -> int:
+        """读取该 solver 当前累计 rlimit count（缺失返回 0）。"""
         try:
             st = solver.statistics()
             for key in st.keys():
                 if key == "rlimit count":
-                    self.rlimit_count += int(st.get_key_value(key))
-                    break
+                    return int(st.get_key_value(key))
         except Exception:  # pragma: no cover - 统计缺失不应影响求解
             pass
+        return 0
+
+    def _accumulate_delta(self, solver, prev: int) -> int:
+        """持久 solver 的 rlimit 是**累计值**，只把本次增量计入 backend 统计；返回新累计值。"""
+        cur = self._rlimit(solver)
+        self.rlimit_count += max(0, cur - prev)
+        return cur
 
     # ---------------- 取值 ----------------
     def value(self, model, term):

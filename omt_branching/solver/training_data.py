@@ -42,45 +42,67 @@ def _initial_extraction(instance: OMTInstance):
     return graph, extraction, backend
 
 
-def build_imitation_example(instance: OMTInstance,
-                            config: "StrongBranchConfig" = None) -> Optional[RankingExample]:
-    """把单实例根图打包成 :class:`RankingExample`：数值 head（LIA 保留）+ bool head
-    （strong-branching 专家，LRA 主路径）标签。"""
-    from omt_branching.solver.strong_branch import StrongBranchConfig, strong_branch_scores
+def build_imitation_example(instance: OMTInstance, config: "StrongBranchConfig" = None,
+                            numeric_expert: str = "coeff") -> Optional[RankingExample]:
+    """把单实例根图打包成 :class:`RankingExample`：数值 head + bool head 标签。
+
+    ``numeric_expert``：``"coeff"``（默认，数值 head 用 |目标系数|，LRA/rl_demo 兼容）或
+    ``"strong"``（数值 head 用整数 strong-branching 目标分离度，LIA B&B 实验用）。
+    bool head 始终用 strong-branching 专家（LRA 主路径）。
+    """
+    from omt_branching.solver.strong_branch import (
+        StrongBranchConfig, strong_branch_numeric_scores, strong_branch_scores,
+    )
 
     cfg = config or StrongBranchConfig()
     graph, extraction, backend = _initial_extraction(instance)
     if graph is None:
         return None
 
-    # --- 数值 head 标签（|目标系数|；LIA 兼容）---
+    # --- 数值 head 标签 ---
     nmap = graph.id_maps.get(NodeType.NUMERIC_VAR, {})
     is_max = instance.sense.value == "max"
     int_scores: dict[int, float] = {}
     int_dirs: dict[int, bool] = {}
-    for nv in extraction.snapshot.numeric_vars:
-        local = nmap.get(nv.num_var_id)
-        if local is None:
-            continue
-        int_scores[local] = abs(nv.objective_coeff)
-        # 朝改善目标的方向 split：MAX 且正系数 -> 向上；MIN 且正系数 -> 向下。
-        int_dirs[local] = (nv.objective_coeff >= 0) == is_max
+    if numeric_expert == "strong":
+        hard, obj, sense = instance.as_tuple()
+        phi = backend.conjoin(*hard)
+        raw_num, raw_dir = strong_branch_numeric_scores(extraction, phi, obj, sense, backend, cfg)
+        for vid, sc in raw_num.items():
+            local = nmap.get(vid)
+            if local is not None:
+                int_scores[local] = sc
+        for vid, up in raw_dir.items():
+            local = nmap.get(vid)
+            if local is not None:
+                int_dirs[local] = up
+    else:  # "coeff"：|目标系数|（LRA/rl_demo 兼容）
+        for nv in extraction.snapshot.numeric_vars:
+            local = nmap.get(nv.num_var_id)
+            if local is None:
+                continue
+            int_scores[local] = abs(nv.objective_coeff)
+            # 朝改善目标的方向 split：MAX 且正系数 -> 向上；MIN 且正系数 -> 向下。
+            int_dirs[local] = (nv.objective_coeff >= 0) == is_max
 
     # --- bool head 标签（strong branching；LRA 主路径）---
-    hard, obj, sense = instance.as_tuple()
-    phi = backend.conjoin(*hard)
-    raw_scores, raw_phases = strong_branch_scores(extraction, phi, obj, sense, backend, cfg)
-    bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+    # LIA（numeric_expert="strong"）只用数值 head，bool head 不参与求解，故跳过昂贵且无用的
+    # bool strong 标签计算。
     bool_scores: dict[int, float] = {}
     phase_targets: dict[int, bool] = {}
-    for bid, sc in raw_scores.items():
-        local = bmap.get(bid)
-        if local is not None:
-            bool_scores[local] = sc
-    for bid, ph in raw_phases.items():
-        local = bmap.get(bid)
-        if local is not None:
-            phase_targets[local] = ph
+    if numeric_expert != "strong":
+        hard, obj, sense = instance.as_tuple()
+        phi = backend.conjoin(*hard)
+        raw_scores, raw_phases = strong_branch_scores(extraction, phi, obj, sense, backend, cfg)
+        bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+        for bid, sc in raw_scores.items():
+            local = bmap.get(bid)
+            if local is not None:
+                bool_scores[local] = sc
+        for bid, ph in raw_phases.items():
+            local = bmap.get(bid)
+            if local is not None:
+                phase_targets[local] = ph
 
     if not int_scores and not bool_scores:
         return None
@@ -88,11 +110,11 @@ def build_imitation_example(instance: OMTInstance,
                           bool_target_scores=bool_scores, phase_targets=phase_targets)
 
 
-def build_imitation_examples(instances) -> list[RankingExample]:
+def build_imitation_examples(instances, numeric_expert: str = "coeff") -> list[RankingExample]:
     """对一组实例批量构造 imitation 训练样本（跳过无数值候选/不可行者）。"""
     out: list[RankingExample] = []
     for inst in instances:
-        ex = build_imitation_example(inst)
+        ex = build_imitation_example(inst, numeric_expert=numeric_expert)
         if ex is not None:
             out.append(ex)
     return out

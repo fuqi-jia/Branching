@@ -111,7 +111,13 @@ class Z3SnapshotExtractor:
                 elif coeff == 1.0 and info.kind == AtomKind.LE:
                     uppers[vname] = min(uppers.get(vname, _INF), info.rhs)
 
-        # 4) 数值变量信息 + 句柄。
+        # 4) LP 松弛值（把整数变量松弛为实数解 LP）——预测 strong-branching 的关键特征
+        #    （learn-to-branch 标准做法；z3 不暴露 LP，故此处自行求解）。仅当存在整数变量时
+        #    计算（LRA 全实数无意义且会增开销），失败/无整数则为空。
+        has_int = any(bool(z3.is_int(e)) for e in var_exprs.values())
+        lp_vals = self._lp_relaxation(atom_infos, obj_coeffs) if has_int else {}
+
+        # 5) 数值变量信息 + 句柄。
         numeric_infos: list[NumericVarInfo] = []
         numeric_handles: dict[Hashable, Handle] = {}
         for name, expr in var_exprs.items():
@@ -119,9 +125,12 @@ class Z3SnapshotExtractor:
             lo = lowers.get(name)
             up = uppers.get(name)
             is_int = bool(z3.is_int(expr))
+            lp_v = lp_vals.get(name)
+            is_frac = lp_v is not None and abs(lp_v - round(lp_v)) > 1e-6
             numeric_infos.append(NumericVarInfo(
-                num_var_id=name, is_integer=is_int, lp_value=val,
-                lower_bound=lo, upper_bound=up, is_fractional=False,
+                num_var_id=name, is_integer=is_int,
+                lp_value=lp_v if lp_v is not None else val,   # 有 LP 松弛用之，否则回退 incumbent 取值
+                lower_bound=lo, upper_bound=up, is_fractional=is_frac,
                 objective_coeff=obj_coeffs.get(name, 0.0),
             ))
             numeric_handles[name] = Handle("numeric", expr, name,
@@ -162,6 +171,52 @@ class Z3SnapshotExtractor:
             snapshot_id=f"gomt-step-{state.step}",
         )
         return Extraction(snapshot, atom_handles, numeric_handles)
+
+    def _lp_relaxation(self, atom_infos, obj_coeffs) -> dict:
+        """整数变量松弛为实数解 LP，返回 ``{var_name: lp_value(float)}``；不可行/异常返回 ``{}``。
+
+        用抽取得到的线性原子（``var_coeffs``/``rhs``/``kind``）与目标系数重建纯实数 LP。这给 GNN
+        提供预测 strong-branching 分离度的 LP 特征（``objective_coeff`` 单独与之几乎无关）。z3 不
+        暴露内部 LP，故此处自行以实数 ``Optimize`` 求解一次（相对整数 check-sat 开销可忽略）。
+        """
+        names: set = set()
+        for a in atom_infos:
+            names.update(a.var_coeffs.keys())
+        names.update(obj_coeffs.keys())
+        if not names:
+            return {}
+        R = {n: z3.Real(f"_lp_{n}") for n in names}
+        o = z3.Optimize()
+        for a in atom_infos:
+            if not a.var_coeffs:
+                continue
+            lhs = z3.Sum([z3.RealVal(str(c)) * R[v] for v, c in a.var_coeffs.items() if v in R])
+            b = z3.RealVal(str(a.rhs))
+            if a.kind == AtomKind.LE:
+                o.add(lhs <= b)
+            elif a.kind == AtomKind.GE:
+                o.add(lhs >= b)
+            elif a.kind == AtomKind.EQ:
+                o.add(lhs == b)
+        if obj_coeffs:
+            obj = z3.Sum([z3.RealVal(str(c)) * R[v] for v, c in obj_coeffs.items() if v in R])
+            if self.sense is Sense.MIN:
+                o.minimize(obj)
+            else:
+                o.maximize(obj)
+        try:
+            if o.check() != z3.sat:
+                return {}
+            m = o.model()
+            out: dict = {}
+            for n, r in R.items():
+                try:
+                    out[n] = float(m.eval(r, model_completion=True).as_fraction())
+                except Exception:
+                    out[n] = None
+            return out
+        except Exception:  # pragma: no cover - LP 异常不应中断主抽取
+            return {}
 
     # ------------------------------------------------------------------ #
     def _walk(self, e, atoms: list, bools: list, visited: set) -> None:

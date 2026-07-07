@@ -163,4 +163,74 @@ class BaselineStrategy:
         return SplitDecision.split(subs, source="baseline")
 
 
-__all__ = ["NeuralStrategy", "BaselineStrategy", "StrategyConfig"]
+class NumericHeuristicStrategy:
+    """整数变量域切分的启发式基线（plain 模式）。
+
+    ``mode``：
+    - ``largest_domain``：最大域跨度变量（同 BaselineStrategy）。
+    - ``largest_coeff``：最大 |目标系数| 变量。
+    - ``random``：随机整数变量（``seed`` 决定，确定性）。
+    - ``strong``：strong-branching 目标分离度最大变量（昂贵 skyline）。
+    只对整数变量域切分，soundness 与 NeuralStrategy 同一 calculus。
+    """
+
+    def __init__(self, problem, mode: str = "largest_domain", seed: int = 0,
+                 config: StrategyConfig = StrategyConfig()):
+        import random as _random
+
+        self.problem = problem
+        self.mode = mode
+        self.config = config
+        self.extractor = Z3SnapshotExtractor(problem)
+        self._rng = _random.Random(seed)
+
+    def propose(self, state, backend) -> SplitDecision:
+        depth = state.stats.get("branch_depth", 0)
+        if depth >= self.config.max_split_depth:
+            return SplitDecision.resolve()
+        try:
+            view = replace(state, hard=backend.conjoin(state.hard, state.top))
+            extraction = self.extractor.extract(view, backend)
+        except Exception as exc:
+            warnings.warn(f"NumericHeuristicStrategy 抽取失败，回退 resolve: {exc!r}")
+            return SplitDecision.resolve()
+
+        cands = [h for h in extraction.numeric_handles.values()
+                 if h.is_integer and h.lower is not None and h.upper is not None
+                 and h.upper - h.lower >= 1]
+        if not cands:
+            return SplitDecision.resolve()
+
+        handle, branch_up = self._pick(cands, extraction, backend, state)
+        if handle is None:
+            return SplitDecision.resolve()
+        subs = _numeric_split(handle, state.top, backend, branch_up)
+        if subs is None:
+            return SplitDecision.resolve()
+        state.stats["branch_depth"] = depth + 1
+        return SplitDecision.split(subs, source=f"heur:{self.mode}")
+
+    def _pick(self, cands, extraction, backend, state):
+        """返回 (handle, branch_up)。"""
+        if self.mode == "largest_domain":
+            return max(cands, key=lambda h: h.upper - h.lower), False
+        if self.mode == "largest_coeff":
+            obj_coeffs = extraction.snapshot.objective.var_coeffs
+            return max(cands, key=lambda h: abs(obj_coeffs.get(h.var_id, 0.0))), False
+        if self.mode == "random":
+            return self._rng.choice(cands), False
+        if self.mode == "strong":
+            from omt_branching.solver.strong_branch import strong_branch_numeric_scores
+            phi = backend.conjoin(state.hard, state.top)
+            scores, dirs = strong_branch_numeric_scores(
+                extraction, phi, state.objective, state.sense, backend)
+            by_id = {h.var_id: h for h in cands}
+            best = max((v for v in scores if v in by_id),
+                       key=lambda v: scores[v], default=None)
+            if best is None:
+                return cands[0], False
+            return by_id[best], dirs.get(best, False)
+        return cands[0], False
+
+
+__all__ = ["NeuralStrategy", "BaselineStrategy", "NumericHeuristicStrategy", "StrategyConfig"]

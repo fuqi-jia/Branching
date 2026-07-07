@@ -159,6 +159,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30, help="imitation 轮数")
     parser.add_argument("--max-steps", type=int, default=80, help="每个 episode 的步数预算")
     parser.add_argument("--split-depth", type=int, default=3, help="每 Δ-round 的 split 预算")
+    parser.add_argument("--saturation-bonus", type=float, default=8.0,
+                        help="RL 终局饱和(optimal)奖励，抵消分支换 gap 而失精确")
     parser.add_argument("--rl-log", action="store_true", help="逐实例打印 RL 训练日志")
     args = parser.parse_args()
 
@@ -206,6 +208,7 @@ def main() -> None:
     rl_config = RLConfig(
         lr=1e-3, gamma=0.98, entropy_coef=5e-3,
         rlimit_penalty_coef=1.0, use_log_cost=True, reward_scale=1.0,
+        saturation_bonus=args.saturation_bonus,
         max_split_depth=args.split_depth, max_steps=args.max_steps,
         f_sat_mode=F_SAT_MODE,
     )
