@@ -43,3 +43,33 @@ def test_extract_robust_on_incumbent_values():
     assert h.current_value is not None
     # candidate sets populated for the policy
     assert ex.snapshot.candidate_numeric_ids
+
+
+def _atom(kind, coeffs, rhs):
+    from omt_branching.input.solver_state import TheoryAtomInfo
+    from omt_branching.interfaces import AtomKind
+    return TheoryAtomInfo(atom_id="a", bool_var_id="b", kind=getattr(AtomKind, kind),
+                          var_coeffs=coeffs, rhs=float(rhs))
+
+
+def test_lp_relaxation_bounded_gives_optimum():
+    """有界 LP：0<=x<=10 maximize x -> lp_value x=10。"""
+    x = z3.Int("x")
+    ext = Z3SnapshotExtractor(GOMTProblem(hard_list=(x >= 0, x <= 10), objective=x, sense=Sense.MAX))
+    lp = ext._lp_relaxation([_atom("GE", {"x": 1.0}, 0.0), _atom("LE", {"x": 1.0}, 10.0)], {"x": 1.0})
+    assert lp.get("x") == 10.0
+
+
+def test_lp_relaxation_unbounded_returns_empty():
+    """无界 LP（只有 x>=0，maximize x 无上界）：不得产出任意 model 值当 lp_value。"""
+    x = z3.Int("x")
+    ext = Z3SnapshotExtractor(GOMTProblem(hard_list=(x >= 0,), objective=x, sense=Sense.MAX))
+    lp = ext._lp_relaxation([_atom("GE", {"x": 1.0}, 0.0)], {"x": 1.0})
+    assert lp == {}
+
+
+def test_lp_relaxation_no_objective_returns_empty():
+    """无目标系数时 lp_value 无意义，返回空。"""
+    x = z3.Int("x")
+    ext = Z3SnapshotExtractor(GOMTProblem(hard_list=(x >= 0, x <= 5), objective=x, sense=Sense.MAX))
+    assert ext._lp_relaxation([_atom("GE", {"x": 1.0}, 0.0), _atom("LE", {"x": 1.0}, 5.0)], {}) == {}
