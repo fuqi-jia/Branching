@@ -39,27 +39,36 @@ def _measure_native(hard, obj, sense) -> dict:
     return {"solve_calls": backend.solve_calls, "rlimit": backend.rlimit_count}
 
 
+_KEYS = ("rlimit", "solve_calls", "splits", "steps")
+
+
 def compare(policy, rl_config, instances, max_steps, modes):
-    """对每个实例跑各策略，返回策略 -> 平均 {solve_calls, splits, steps, match}。"""
+    """对每个实例跑各策略，返回策略 -> 平均 {rlimit, solve_calls, splits, steps, match}。
+
+    ``rlimit``（z3 内部工作量计数）是跨方法**公平**的开销度量——native 的 ``solve_calls=1``
+    只是一次 API 调用，其内部递归 B&B 的实际工作量由 rlimit 体现；``solve_calls`` 仅在 GOMT
+    各策略间可比。
+    """
     names = ["native", *modes, "neural"]
-    agg = {n: {"solve_calls": 0.0, "splits": 0.0, "steps": 0.0, "match": 0.0} for n in names}
+    agg = {n: {k: 0.0 for k in (*_KEYS, "match")} for n in names}
     for inst in instances:
         hard, obj, sense = inst.as_tuple()
         native = solve_native(hard, obj, sense)
         nat = _measure_native(hard, obj, sense)
+        agg["native"]["rlimit"] += nat["rlimit"]
         agg["native"]["solve_calls"] += nat["solve_calls"]
         agg["native"]["match"] += 1.0
         for m in modes:
             r = solve_and_measure(hard, obj, sense,
                                   lambda p, m=m: NumericHeuristicStrategy(p, mode=m, seed=0),
                                   max_steps=max_steps, f_sat_mode=F_SAT_MODE)
-            for k in ("solve_calls", "splits", "steps"):
+            for k in _KEYS:
                 agg[m][k] += r[k]
             agg[m]["match"] += 1.0 if r["value"] == native else 0.0
         rn = solve_and_measure(hard, obj, sense,
                                lambda p: RLRecordingStrategy(p, policy, rl_config, sample=False),
                                max_steps=max_steps, f_sat_mode=F_SAT_MODE)
-        for k in ("solve_calls", "splits", "steps"):
+        for k in _KEYS:
             agg["neural"][k] += rn[k]
         agg["neural"]["match"] += 1.0 if rn["value"] == native else 0.0
     n = max(1, len(instances))
@@ -110,14 +119,15 @@ def main() -> None:
     if args.with_strong:
         modes.append("strong")
     agg = compare(policy, rl_config, test, args.max_steps, modes)
-    print(f"  {'strategy':<16} {'solve_calls':>12} {'splits':>10} {'steps':>10} {'match':>8}")
+    print(f"  {'strategy':<16} {'rlimit':>14} {'solve_calls':>12} {'splits':>10} "
+          f"{'steps':>10} {'match':>8}")
     for name in ["native", *modes, "neural"]:
         a = agg[name]
-        print(f"  {name:<16} {a['solve_calls']:>12.2f} {a['splits']:>10.2f} "
+        print(f"  {name:<16} {a['rlimit']:>14.0f} {a['solve_calls']:>12.2f} {a['splits']:>10.2f} "
               f"{a['steps']:>10.2f} {a['match']:>8.2f}")
-    print("\nplain 模式：所有策略饱和到 == native 精确最优；比较搜索规模。"
-          "neural 目标：solve_calls/splits 低于启发式（框架内学习分支的收益）；"
-          "native 为 skyline（外层 GOMT 分支不与之比 wall-clock）。")
+    print("\nplain 模式：所有策略饱和到 == native 精确最优。**rlimit（z3 内部工作量）是跨方法公平"
+          "度量**；native solve_calls=1 只是一次 API 调用、其内部递归工作量由 rlimit 体现，故"
+          "solve_calls 仅在 GOMT 各策略间可比。neural 目标：rlimit/solve_calls 低于启发式。")
 
 
 if __name__ == "__main__":

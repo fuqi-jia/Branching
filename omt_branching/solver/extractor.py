@@ -185,6 +185,8 @@ class Z3SnapshotExtractor:
         names.update(obj_coeffs.keys())
         if not names:
             return {}
+        if not obj_coeffs:
+            return {}          # 无目标则 LP 取值无意义（任意可行点），不产出 LP 特征
         R = {n: z3.Real(f"_lp_{n}") for n in names}
         o = z3.Optimize()
         for a in atom_infos:
@@ -198,14 +200,16 @@ class Z3SnapshotExtractor:
                 o.add(lhs >= b)
             elif a.kind == AtomKind.EQ:
                 o.add(lhs == b)
-        if obj_coeffs:
-            obj = z3.Sum([z3.RealVal(str(c)) * R[v] for v, c in obj_coeffs.items() if v in R])
-            if self.sense is Sense.MIN:
-                o.minimize(obj)
-            else:
-                o.maximize(obj)
+        obj = z3.Sum([z3.RealVal(str(c)) * R[v] for v, c in obj_coeffs.items() if v in R])
+        handle = o.minimize(obj) if self.sense is Sense.MIN else o.maximize(obj)
         try:
             if o.check() != z3.sat:
+                return {}
+            # 无界/未达最优（±oo / epsilon）时 z3 仍报 sat 但 model 为任意点——放弃，避免把
+            # 无意义值当 LP 特征喂给 GNN（宁可回退 incumbent 取值）。
+            bound = o.upper(handle) if self.sense is not Sense.MIN else o.lower(handle)
+            btext = str(bound)
+            if "oo" in btext or "epsilon" in btext:
                 return {}
             m = o.model()
             out: dict = {}
