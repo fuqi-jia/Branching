@@ -29,14 +29,20 @@ from omt_branching.solver.rl import (
     solve_and_measure,
 )
 from omt_branching.solver.instance_gen import (
-    LRA_FAMILIES, OMTInstance, generate_dataset, generate_hard_lia_dataset,
-    generate_hard_lia_instance, generate_instance, generate_lra_dataset,
-    generate_lra_instance, oracle_numeric_choice,
+    LRA_FAMILIES, OMTInstance, generate_bool_lia_dataset, generate_bool_lia_instance,
+    generate_dataset, generate_hard_lia_dataset, generate_hard_lia_instance,
+    generate_instance, generate_lra_dataset, generate_lra_instance, oracle_numeric_choice,
 )
 from omt_branching.solver.training_data import (
     build_imitation_example, build_imitation_examples, policy_numeric_choice,
     baseline_numeric_choice, bool_branch_hit,
 )
+from omt_branching.solver.propagator_snapshot import (
+    atom_key, build_bool_snapshot, collect_atoms,
+)
+from omt_branching.solver.propagator import LearnedDecidePropagator
+from omt_branching.solver.policy_decider import PolicyDecider
+from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.strong_branch import (
     StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
     strong_branch_numeric_scores, strong_branch_scores,
@@ -85,6 +91,8 @@ __all__ = [
     "generate_lra_dataset",
     "generate_hard_lia_instance",
     "generate_hard_lia_dataset",
+    "generate_bool_lia_instance",
+    "generate_bool_lia_dataset",
     "LRA_FAMILIES",
     "oracle_numeric_choice",
     # 训练数据
@@ -99,4 +107,11 @@ __all__ = [
     "strong_branch_scores",
     "oracle_numeric_choice_sb",
     "strong_branch_numeric_scores",
+    # UserPropagator 学习分支（Phase 1）
+    "atom_key",
+    "collect_atoms",
+    "build_bool_snapshot",
+    "LearnedDecidePropagator",
+    "PolicyDecider",
+    "solve_omt_with_decider",
 ]

@@ -104,6 +104,53 @@ def generate_dataset(count: int, seed: int = 0, *, id_prefix: str = "inst",
     return [generate_instance(f"{id_prefix}{i}", rng, **kwargs) for i in range(count)]
 
 
+def generate_bool_lia_instance(instance_id: str, rng: random.Random, *,
+                               n_vars: int = 5, n_disj: int = 5, k: int = 3, ub: int = 8,
+                               chi: int = 4, sense: Sense = Sense.MAX) -> OMTInstance:
+    """带**布尔结构**的有界整数 OMT：若干 ``k`` 元析取(``Or`` of 线性不等式)制造真正的布尔
+    分支点(z3 须 case-split),供 UserPropagator 学习分支研究。witness 驱动保证 SAT + 有界。"""
+    xs = [z3.Int(f"{instance_id}_x{j}") for j in range(n_vars)]
+    names = [f"{instance_id}_x{j}" for j in range(n_vars)]
+    witness = [rng.randint(0, ub) for _ in range(n_vars)]
+
+    hard: list = []
+    for x in xs:
+        hard.append(x >= 0)
+        hard.append(x <= ub)
+
+    def _ineq(sat_at_witness: bool):
+        coeffs = [rng.randint(1, chi) for _ in range(n_vars)]
+        lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
+        v = sum(c * w for c, w in zip(coeffs, witness))
+        if sat_at_witness:                     # witness 满足：<= v + slack
+            return lhs <= v + rng.randint(0, 2)
+        return lhs >= v + rng.randint(1, 4)    # witness 不满足：> v
+
+    for _ in range(n_disj):
+        sat_idx = rng.randrange(k)             # 令第 sat_idx 个 disjunct 在 witness 上为真
+        lits = [_ineq(i == sat_idx) for i in range(k)]
+        hard.append(z3.Or(*lits))
+
+    obj_c = [rng.randint(1, chi) for _ in range(n_vars)]
+    objective = z3.Sum([c * x for c, x in zip(obj_c, xs)])
+    return OMTInstance(
+        instance_id=instance_id, variables=xs, hard=hard, objective=objective, sense=sense,
+        obj_coeffs={n: float(c) for n, c in zip(names, obj_c)},
+        theory="LIA", family="bool", description=f"bool LIA, {n_vars} vars {n_disj} disj",
+    )
+
+
+def generate_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "blia",
+                              min_vars: int = 5, max_vars: int = 7, **kwargs) -> list[OMTInstance]:
+    """生成 ``count`` 个带布尔结构的有界整数 OMT 实例。"""
+    rng = random.Random(seed)
+    out: list[OMTInstance] = []
+    for i in range(count):
+        n_vars = rng.randint(min_vars, max_vars)
+        out.append(generate_bool_lia_instance(f"{id_prefix}{i}", rng, n_vars=n_vars, **kwargs))
+    return out
+
+
 def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
                                n_vars: int = 6, n_constraints: int = 4, ub: int = 8,
                                coeff_lo: int = 1, coeff_hi: int = 5, slack: int = 1,
@@ -460,6 +507,8 @@ __all__ = [
     "generate_dataset",
     "generate_hard_lia_instance",
     "generate_hard_lia_dataset",
+    "generate_bool_lia_instance",
+    "generate_bool_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
     "LRA_FAMILIES",

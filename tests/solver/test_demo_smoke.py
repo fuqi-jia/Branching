@@ -28,6 +28,16 @@ def test_rl_lra_smoke_reports_bool_accuracy():
     assert "bool 分支准确率" in out.stdout or "bool-head" in out.stdout
 
 
+def test_decide_branch_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.decide_branch",
+         "--test", "5", "--min-vars", "4", "--max-vars", "4"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "三臂对比" in out.stdout
+
+
 def test_lia_branch_smoke_reaches_native():
     out = subprocess.run(
         [sys.executable, "-m", "examples.lia_branch",
