@@ -17,14 +17,14 @@ def test_propagating_atom_outranks_isolated():
     assert atom_key(a) in ph and isinstance(ph[atom_key(a)], bool)
 
 
-def test_failed_literal_gets_sentinel():
+def test_entailed_atom_is_skipped():
     x = z3.Int("x")
-    # a: x>=8, 但另有 x<=3 硬约束 -> 假设 a=True 不可行 -> a 被强制为假(大哨兵)
+    # a: x>=8, 但硬约束 x<=3 -> 假设 a=True 不可行 = a 被蕴含为假 = 非决策点 -> 跳过(不打分)。
     a = x >= 8
     hard = [x >= 0, x <= 10, x <= 3, z3.Or(a, x >= 1)]
-    sc, ph = lookahead_scores(hard, atoms=[a], config=LookaheadConfig(sentinel=1e6))
-    assert sc[atom_key(a)] >= 1e6      # failed literal
-    assert ph[atom_key(a)] is False    # 可行侧是 a=False
+    sc, ph = lookahead_scores(hard, atoms=[a])
+    assert atom_key(a) not in sc       # 被蕴含/矛盾的原子不作为根决策标签
+    assert atom_key(a) not in ph
 
 
 def test_build_lookahead_examples_has_bool_labels():
@@ -39,3 +39,20 @@ def test_build_lookahead_examples_has_bool_labels():
     n_bool = e.graph.num_nodes(NodeType.BOOL_VAR)
     assert all(0 <= k < n_bool for k in e.bool_target_scores)
     assert e.phase_targets   # phase 标签也在
+
+
+def test_lookahead_imitation_reduces_branch_loss():
+    import torch
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.training_data import build_lookahead_examples
+    from omt_branching.model.policy import BranchingPolicy
+    from omt_branching.model.trainer import ImitationTrainer, TrainConfig
+
+    torch.manual_seed(0)
+    ds = generate_bool_lia_dataset(24, seed=7, min_vars=5, max_vars=6)
+    exs = [e for e in build_lookahead_examples(ds) if e.bool_target_scores]
+    assert exs, "应有带 bool 标签的样本"
+    policy = BranchingPolicy()
+    h = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(exs, epochs=15)
+    assert "branch" in h[0]
+    assert h[-1]["branch"] < h[0]["branch"]   # look-ahead 标签可学（子句图 = 特征）

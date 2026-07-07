@@ -14,7 +14,6 @@ from omt_branching.solver.propagator_snapshot import atom_key, collect_atoms
 @dataclass(frozen=True)
 class LookaheadConfig:
     max_atoms: int = 32
-    sentinel: float = 1e6
     eps: float = 1e-9
 
 
@@ -24,15 +23,18 @@ def _strip_not(e):
     return e
 
 
-def _count_other(imps, self_key: str) -> int:
-    """统计蕴含到的**其他**原子数（剥离 Not，排除自身/双重否定）。"""
-    seen = set()
+def _implied_keys(imps) -> set:
+    """从 consequences 的 implication 列表提取被蕴含原子的键集合（剥离 Not / 双重否定）。"""
+    out = set()
     for imp in imps:
         cons = imp.arg(1) if (z3.is_implies(imp) and imp.num_args() == 2) else imp
-        k = atom_key(_strip_not(cons))
-        if k != self_key:
-            seen.add(k)
-    return len(seen)
+        out.add(atom_key(_strip_not(cons)))
+    return out
+
+
+def _count_marginal(imps, self_key: str, base_keys: set) -> int:
+    """假设某原子后**边际**蕴含的其他原子数：扣除 hard 单独就蕴含的（``base_keys``）与自身。"""
+    return len(_implied_keys(imps) - base_keys - {self_key})
 
 
 def lookahead_scores(assertions, atoms=None, config: LookaheadConfig = LookaheadConfig()):
@@ -40,6 +42,14 @@ def lookahead_scores(assertions, atoms=None, config: LookaheadConfig = Lookahead
     atom_exprs = atom_exprs[: config.max_atoms]
     s = z3.Solver()
     s.add(*assertions)
+
+    # hard 单独(无假设)就蕴含的原子——与任何假设无关，须从每个假设的传播里扣除，否则每个
+    # 原子都"蕴含"这批 box/entailed 原子，计数恒等 -> 标签 uniform 无法学。
+    try:
+        _, base_imp = s.consequences([], atom_exprs)
+        base_keys = _implied_keys(base_imp)
+    except z3.Z3Exception:
+        base_keys = set()
 
     scores: dict = {}
     phases: dict = {}
@@ -50,21 +60,14 @@ def lookahead_scores(assertions, atoms=None, config: LookaheadConfig = Lookahead
             res_f, imp_f = s.consequences([z3.Not(a)], atom_exprs)
         except z3.Z3Exception:
             continue
-        t_unsat = res_t == z3.unsat
-        f_unsat = res_f == z3.unsat
-        if t_unsat and f_unsat:
-            continue                      # 两侧皆不可行：矛盾/无关，跳过
-        if t_unsat:                       # a=True 不可行 -> a 被强制为假
-            scores[k] = config.sentinel
-            phases[k] = False
+        # 根状态下某侧不可行 = 该原子被 hard 蕴含/矛盾 -> **不是决策点**（z3 会传播而非分支），
+        # 跳过。否则大量 box 原子(x>=0/x<=ub 的取反必 unsat)会以相同大分 swamp 真实 look-ahead
+        # 信号，使标签近乎 uniform、无法学习。failed-literal 是搜索期(部分赋值下)的概念，非根标签。
+        if res_t == z3.unsat or res_f == z3.unsat:
             continue
-        if f_unsat:
-            scores[k] = config.sentinel
-            phases[k] = True
-            continue
-        pt = _count_other(imp_t, k)
-        pf = _count_other(imp_f, k)
-        scores[k] = (pt + 1.0) * (pf + 1.0)   # march 风格 product：两侧都传播多者优
+        pt = _count_marginal(imp_t, k, base_keys)
+        pf = _count_marginal(imp_f, k, base_keys)
+        scores[k] = (pt + 1.0) * (pf + 1.0)   # march 风格 product：两侧都边际传播多者优
         phases[k] = pt >= pf                  # 先探传播更多的一侧
     return scores, phases
 

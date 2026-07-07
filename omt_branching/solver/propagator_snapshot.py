@@ -99,15 +99,28 @@ def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
     atoms = collect_atoms(assertions)
     amap = {atom_key(t): t for t in atoms}
 
-    bool_vars = [
-        BooleanVarInfo(var_id=k, assignment=assignment.get(k), is_candidate=True)
-        for k in amap
-    ]
+    # per-atom 子句统计（度/极性）——布尔节点本身无区分特征(赋值/默认全同)，若不给结构特征，
+    # GNN 会把所有原子塌缩成相同 embedding、分数相同、梯度为零、无法学。子句度+极性是区分指纹。
+    occ = {k: 0 for k in amap}
+    pos = {k: 0 for k in amap}
+    neg = {k: 0 for k in amap}
     clauses = []
     for i, a in enumerate(assertions):
         lits = [(k, p) for (k, p) in _clause_literals(a) if k in amap]
+        for k, p in lits:
+            occ[k] += 1
+            if p:
+                pos[k] += 1
+            else:
+                neg[k] += 1
         if lits:
             clauses.append(ClauseInfo(clause_id=f"c{i}", literals=lits))
+
+    bool_vars = [
+        BooleanVarInfo(var_id=k, assignment=assignment.get(k), is_candidate=True,
+                       occurrence_count=occ[k], pos_count=pos[k], neg_count=neg[k])
+        for k in amap
+    ]
 
     search_state = SearchStateInfo(
         decision_level=int(stats.get("decisions", 0)),
