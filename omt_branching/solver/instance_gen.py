@@ -158,6 +158,20 @@ def generate_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "bl
     return out
 
 
+def generate_hard_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "hblia",
+                                   min_vars: int = 6, max_vars: int = 8, **kwargs) -> list[OMTInstance]:
+    """更难的布尔结构整数 OMT：更多析取(n_disj=24)、更大子句(k=4)、更紧原子池(pool_mult=1)，
+    使 z3 VSIDS 探索更多冲突 -> 给学习分支留 headroom。"""
+    hard_defaults = dict(n_disj=24, k=4, ub=10, chi=5, pool_mult=1)
+    hard_defaults.update(kwargs)
+    rng = random.Random(seed)
+    out: list[OMTInstance] = []
+    for i in range(count):
+        n_vars = rng.randint(min_vars, max_vars)
+        out.append(generate_bool_lia_instance(f"{id_prefix}{i}", rng, n_vars=n_vars, **hard_defaults))
+    return out
+
+
 def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
                                n_vars: int = 6, n_constraints: int = 4, ub: int = 8,
                                coeff_lo: int = 1, coeff_hi: int = 5, slack: int = 1,
@@ -516,6 +530,7 @@ __all__ = [
     "generate_hard_lia_dataset",
     "generate_bool_lia_instance",
     "generate_bool_lia_dataset",
+    "generate_hard_bool_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
     "LRA_FAMILIES",

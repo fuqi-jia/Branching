@@ -29,7 +29,7 @@ from omt_branching.solver.rl import (
     solve_and_measure,
 )
 from omt_branching.solver.instance_gen import (
-    LRA_FAMILIES, OMTInstance, generate_bool_lia_dataset, generate_bool_lia_instance,
+    LRA_FAMILIES, OMTInstance, generate_bool_lia_dataset, generate_bool_lia_instance, generate_hard_bool_lia_dataset,
     generate_dataset, generate_hard_lia_dataset, generate_hard_lia_instance,
     generate_instance, generate_lra_dataset, generate_lra_instance, oracle_numeric_choice,
 )
@@ -93,6 +93,7 @@ __all__ = [
     "generate_hard_lia_dataset",
     "generate_bool_lia_instance",
     "generate_bool_lia_dataset",
+    "generate_hard_bool_lia_dataset",
     "LRA_FAMILIES",
     "oracle_numeric_choice",
     # 训练数据
