@@ -214,10 +214,38 @@ def build_lookahead_examples(instances, config=None):
     return out
 
 
+def build_lookahead_examples_sat(problems, config=None):
+    """SAT look-ahead imitation 样本：``problems = list[(atoms, clauses)]``（同生成器返回序）。"""
+    from omt_branching.solver.lookahead import LookaheadConfig, lookahead_scores
+    from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+
+    cfg = config or LookaheadConfig()
+    out: list[RankingExample] = []
+    for atoms, assertions in problems:
+        snap, _ = build_bool_snapshot(list(assertions))
+        graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
+        scores, phases = lookahead_scores(list(assertions), atoms=list(atoms), config=cfg)
+        bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+        bts: dict[int, float] = {}
+        pts: dict[int, bool] = {}
+        for k, sc in scores.items():
+            loc = bmap.get(k)
+            if loc is not None:
+                bts[loc] = sc
+        for k, ph in phases.items():
+            loc = bmap.get(k)
+            if loc is not None:
+                pts[loc] = ph
+        if bts:
+            out.append(RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts))
+    return out
+
+
 __all__ = [
     "build_imitation_example",
     "build_imitation_examples",
     "build_lookahead_examples",
+    "build_lookahead_examples_sat",
     "policy_numeric_choice",
     "baseline_numeric_choice",
     "bool_branch_hit",

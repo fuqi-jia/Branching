@@ -22,3 +22,20 @@ def test_override_arm_controls_and_correct():
         decider_factory=lambda a: (lambda und, asg: (min(und), True)))
     assert r["result"] == "unsat"
     assert r["decisions"] > 0                               # 我们强制了决策
+
+
+def test_build_lookahead_examples_sat_learnable():
+    import torch
+    from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat
+    from omt_branching.solver.training_data import build_lookahead_examples_sat
+    from omt_branching.model.policy import BranchingPolicy
+    from omt_branching.model.trainer import ImitationTrainer, TrainConfig
+
+    torch.manual_seed(0)
+    problems = [generate_php(4)] + [generate_rand_3sat(30, 4.26, s) for s in range(6)]
+    exs = [e for e in build_lookahead_examples_sat(problems) if e.bool_target_scores]
+    assert exs, "应有带 bool 标签的样本"
+    policy = BranchingPolicy()
+    h = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(exs, epochs=12)
+    assert "branch" in h[0]
+    assert h[-1]["branch"] < h[0]["branch"]        # 子句图=特征 -> look-ahead 可学
