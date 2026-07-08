@@ -43,6 +43,8 @@ from omt_branching.solver.propagator_snapshot import (
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider
 from omt_branching.solver.decide_omt import solve_omt_with_decider
+from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat
+from omt_branching.solver.sat_solve import solve_sat_with_decider
 from omt_branching.solver.strong_branch import (
     StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
     strong_branch_numeric_scores, strong_branch_scores,
@@ -115,4 +117,7 @@ __all__ = [
     "LearnedDecidePropagator",
     "PolicyDecider",
     "solve_omt_with_decider",
+    "generate_php",
+    "generate_rand_3sat",
+    "solve_sat_with_decider",
 ]

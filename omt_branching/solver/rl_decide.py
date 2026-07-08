@@ -126,10 +126,11 @@ class DecideRLTrainer:
         return steps, reward, res
 
     def train_sat(self, problems, iterations: int = 1, log: bool = False):
+        """``problems = list[(atoms, clauses)]``（同生成器返回序）。"""
         problems = list(problems)
         history = []
         for it in range(iterations):
-            for j, (assertions, atoms) in enumerate(problems):
+            for j, (atoms, assertions) in enumerate(problems):
                 steps, reward, res = self.collect_sat(assertions, atoms)
                 stats = self.update(steps, reward, key=j)
                 stats.update({"iter": it, "instance": j, "conflicts": res["conflicts"]})

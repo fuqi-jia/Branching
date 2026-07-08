@@ -47,3 +47,13 @@ def test_lia_branch_smoke_reaches_native():
     )
     assert out.returncode == 0, out.stderr
     assert "搜索规模" in out.stdout
+
+
+def test_sat_branch_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.sat_branch",
+         "--php", "5", "--sat-n", "40", "--test", "3", "--train", "4", "--epochs", "3"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "VSIDS" in out.stdout
