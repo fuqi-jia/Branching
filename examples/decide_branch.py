@@ -31,22 +31,33 @@ def main() -> None:
     ap.add_argument("--refocus", type=int, default=50)
     ap.add_argument("--train", type=int, default=0, help="look-ahead imitation 训练集规模(0=不训练)")
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--rl-iters", type=int, default=0, help="RL 微调轮数(0=不做 RL)")
+    ap.add_argument("--hard", action="store_true", help="用更难实例(headroom)")
     args = ap.parse_args()
 
+    from omt_branching.solver import generate_hard_bool_lia_dataset
+    gen = generate_hard_bool_lia_dataset if args.hard else generate_bool_lia_dataset
+
     torch.manual_seed(0)
-    insts = generate_bool_lia_dataset(args.test, seed=99,
-                                      min_vars=args.min_vars, max_vars=args.max_vars)
+    insts = gen(args.test, seed=99, min_vars=args.min_vars, max_vars=args.max_vars)
 
     policy = BranchingPolicy()
     if args.train > 0:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
         from omt_branching.solver.training_data import build_lookahead_examples
-        train = generate_bool_lia_dataset(args.train, seed=1,
-                                          min_vars=args.min_vars, max_vars=args.max_vars)
+        train = gen(args.train, seed=1, min_vars=args.min_vars, max_vars=args.max_vars)
         exs = [e for e in build_lookahead_examples(train) if e.bool_target_scores]
         hist = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(exs, epochs=args.epochs)
         print(f"look-ahead imitation: {len(exs)} 样本, branch loss "
               f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}")
+    if args.rl_iters > 0:
+        from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+        rl_train = gen(max(args.train, 40), seed=1, min_vars=args.min_vars, max_vars=args.max_vars)
+        rlt = DecideRLTrainer(policy, DecideRLConfig(refocus_every=args.refocus))
+        h = rlt.train([i.as_tuple() for i in rl_train], iterations=args.rl_iters, log=False)
+        if h:
+            print(f"RL 微调: {len(h)} 步, 末条 reward={h[-1]['reward']:.3f} "
+                  f"conflicts={h[-1]['conflicts']}, defer_logit={float(rlt.defer_logit):.3f}")
     svc = BranchingPolicyService(policy=policy)
 
     agg = {"native": {"rlimit": 0.0},
