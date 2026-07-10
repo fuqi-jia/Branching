@@ -3,9 +3,11 @@ LearnedDecidePropagator 接管内部布尔决策。z3.Optimize 不支持 propaga
 
 三臂对比：decider_factory=None -> VSIDS 臂；给 PolicyDecider -> learned 臂；native 见 solve_native。
 """
+
 from __future__ import annotations
 
 from fractions import Fraction
+import math
 
 import z3
 
@@ -30,8 +32,9 @@ def _num(ref):
     return Fraction(str(ref))
 
 
-def solve_omt_with_decider(hard, objective, sense: Sense,
-                           decider_factory=None, max_iters: int = 100000) -> dict:
+def solve_omt_with_decider(
+    hard, objective, sense: Sense, decider_factory=None, max_iters: int = 100000
+) -> dict:
     s = z3.Solver()
     prop = None
     if decider_factory is not None:
@@ -44,6 +47,7 @@ def solve_omt_with_decider(hard, objective, sense: Sense,
         raise ValueError("硬约束不可满足")
     m = s.model()
     best_val = m.eval(objective, model_completion=True)
+    records = [(best_val, _stat(s, "rlimit count"))]
 
     iters = 0
     for iters in range(1, max_iters + 1):
@@ -53,10 +57,14 @@ def solve_omt_with_decider(hard, objective, sense: Sense,
             break
         m = s.model()
         best_val = m.eval(objective, model_completion=True)
+        records.append((best_val, _stat(s, "rlimit count") - records[-1][1]))
 
     return {
         "value": _num(best_val),
         "rlimit": _stat(s, "rlimit count"),
+        "weighted rlimit": sum(
+            [math.log2(float(best_val) / local + 1) * cost for local, cost in records]
+        ),
         "conflicts": _stat(s, "conflicts"),
         "decisions": (prop.n_decisions if prop is not None else None),
         "iters": iters,

@@ -105,7 +105,7 @@ class DecideRLTrainer:
         res = solve_omt_with_decider(hard, objective, sense,
                                      decider_factory=factory, max_iters=self.config.max_iters)
         steps = holder["d"].steps if "d" in holder else []
-        reward = -math.log1p(res["rlimit"])
+        reward = -math.log1p(res["weighted rlimit"])
         return steps, reward, res
 
     def collect_sat(self, assertions, atoms):
