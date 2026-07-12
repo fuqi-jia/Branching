@@ -41,12 +41,15 @@ def solve_omt_with_decider(
     max_iters: int = 100000,
 ) -> dict:
     s = z3.Solver()
+    solver_rlimit = _stat(s, "rlimit count")
+    rlimit = solver_rlimit
     prop = None
     if decider_factory is not None:
         atoms = collect_atoms(list(hard))
         decider = decider_factory(list(hard))
         prop = LearnedDecidePropagator(s, atoms, decider)
-    rlimit = _stat(s, "rlimit count")
+    decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
+    rlimit += decider_factory_rlimit
 
     s.add(*hard)
     model_rlimit = [_stat(s, "rlimit count") - rlimit]
@@ -107,6 +110,8 @@ def solve_omt_with_decider(
         )
     stats["weighted rlimit"] = weighted_rlimit
 
+    stats["solver rlimit"] = solver_rlimit
+    stats["decider factory rlimit"] = decider_factory_rlimit
     stats["model base rlimit"] = model_rlimit[0]
     stats["model cut rlimit"] = sum(model_rlimit) - model_rlimit[0]
     stats["check rlimit"] = sum(check_rlimit)
