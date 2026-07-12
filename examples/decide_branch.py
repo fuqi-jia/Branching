@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import torch
 
@@ -83,6 +84,8 @@ def main() -> None:
         "native": {"rlimit": 0.0},
         "vsids": {
             "rlimit": 0.0,
+            "solver rlimit": 0.0,
+            "decider factory rlimit": 0.0,
             "model base rlimit": 0.0,
             "model cut rlimit": 0.0,
             "check rlimit": 0.0,
@@ -93,6 +96,8 @@ def main() -> None:
         },
         "learned": {
             "rlimit": 0.0,
+            "solver rlimit": 0.0,
+            "decider factory rlimit": 0.0,
             "model base rlimit": 0.0,
             "model cut rlimit": 0.0,
             "check rlimit": 0.0,
@@ -109,6 +114,8 @@ def main() -> None:
         agg["native"]["rlimit"] += _native_rlimit(hard, obj, sense)
         v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
         agg["vsids"]["rlimit"] += v["rlimit"]
+        agg["vsids"]["solver rlimit"] += v["solver rlimit"]
+        agg["vsids"]["decider factory rlimit"] += v["decider factory rlimit"]
         agg["vsids"]["model base rlimit"] += v["model base rlimit"]
         agg["vsids"]["model cut rlimit"] += v["model cut rlimit"]
         agg["vsids"]["check rlimit"] += v["check rlimit"]
@@ -123,6 +130,8 @@ def main() -> None:
             decider_factory=lambda a: PolicyDecider(svc, a, args.refocus),
         )
         agg["learned"]["rlimit"] += ln["rlimit"]
+        agg["learned"]["solver rlimit"] += ln["solver rlimit"]
+        agg["learned"]["decider factory rlimit"] += ln["decider factory rlimit"]
         agg["learned"]["model base rlimit"] += ln["model base rlimit"]
         agg["learned"]["model cut rlimit"] += ln["model cut rlimit"]
         agg["learned"]["check rlimit"] += ln["check rlimit"]
@@ -136,23 +145,30 @@ def main() -> None:
     print(
         f"=== 三臂对比（{len(insts)} 实例，未训练 GNN；rlimit/conflicts 越小越好，match=1 为正确）==="
     )
-    print(f"  native(z3 Optimize): rlimit={agg['native']['rlimit']/n:.0f}")
-    print(
-        f"  VSIDS-decide       : rlimit={agg['vsids']['rlimit']/n:.0f} weighted={agg['vsids']['weighted rlimit']/n:.0f} "
-        f"model_base={agg['vsids']['model base rlimit']/n:.0f} model_cut={agg['vsids']['model cut rlimit']/n:.0f} "
-        f"check={100.0 * agg['vsids']['check rlimit'] / agg['vsids']['rlimit']:.2f}% eval={100.0 * agg['vsids']['eval rlimit'] / agg['vsids']['rlimit']:.2f}% "
-        f"conflicts={agg['vsids']['conflicts']/n:.1f} match={agg['vsids']['match']/n:.2f}"
-    )
-    print(
-        f"  learned-decide     : rlimit={agg['learned']['rlimit']/n:.0f} weighted={agg['learned']['weighted rlimit']/n:.0f} "
-        f"model_base={agg['learned']['model base rlimit']/n:.0f} model_cut={agg['learned']['model cut rlimit']/n:.0f} "
-        f"check={100.0 * agg['learned']['check rlimit'] / agg['learned']['rlimit']:.2f}% eval={100.0 * agg['learned']['eval rlimit'] / agg['learned']['rlimit']:.2f}% "
-        f"conflicts={agg['learned']['conflicts']/n:.1f} decisions={agg['learned']['decisions']/n:.1f} "
-        f"match={agg['learned']['match']/n:.2f}"
-    )
-    print(
-        "\nPhase 1 目标：learned 臂 match=1（管道正确）+ 可测量。Phase 2 再训练使其优于 VSIDS。"
-    )
+    # print(f"  native(z3 Optimize): rlimit={agg['native']['rlimit']/n:.0f}")
+    # print(
+    #     f"  VSIDS-decide       : rlimit={agg['vsids']['rlimit']/n:.0f} weighted={agg['vsids']['weighted rlimit']/n:.0f} "
+    #     f"model_base={agg['vsids']['model base rlimit']/n:.0f} model_cut={agg['vsids']['model cut rlimit']/n:.0f} "
+    #     f"check={100.0 * agg['vsids']['check rlimit'] / agg['vsids']['rlimit']:.2f}% eval={100.0 * agg['vsids']['eval rlimit'] / agg['vsids']['rlimit']:.2f}% "
+    #     f"conflicts={agg['vsids']['conflicts']/n:.1f} match={agg['vsids']['match']/n:.2f}"
+    # )
+    # print(
+    #     f"  learned-decide     : rlimit={agg['learned']['rlimit']/n:.0f} weighted={agg['learned']['weighted rlimit']/n:.0f} "
+    #     f"model_base={agg['learned']['model base rlimit']/n:.0f} model_cut={agg['learned']['model cut rlimit']/n:.0f} "
+    #     f"check={100.0 * agg['learned']['check rlimit'] / agg['learned']['rlimit']:.2f}% eval={100.0 * agg['learned']['eval rlimit'] / agg['learned']['rlimit']:.2f}% "
+    #     f"conflicts={agg['learned']['conflicts']/n:.1f} decisions={agg['learned']['decisions']/n:.1f} "
+    #     f"match={agg['learned']['match']/n:.2f}"
+    # )
+    # print(
+    #     "\nPhase 1 目标：learned 臂 match=1（管道正确）+ 可测量。Phase 2 再训练使其优于 VSIDS。"
+    # )
+    agg["native"]["rlimit"] /= n
+    for key, value in agg["vsids"].items():
+        value /= n
+    for key, value in agg["learned"].items():
+        value /= n
+    with open("examples/artifacts/results.json", "w") as f:
+        json.dump(agg, f, indent=4)
 
 
 if __name__ == "__main__":
