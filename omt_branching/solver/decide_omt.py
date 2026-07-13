@@ -89,7 +89,10 @@ def solve_omt_with_decider(
     stats = {
         "value": _num(best_val),
         # "rlimit": _stat(s, "rlimit count"),
-        "rlimit": sum(check_rlimit) + sum(eval_rlimit),
+        "rlimit": decider_factory_rlimit
+        + sum(model_rlimit)
+        + sum(check_rlimit)
+        + sum(eval_rlimit),
         "conflicts": _stat(s, "conflicts"),
         "decisions": (prop.n_decisions if prop is not None else None),
         "iters": iters,
@@ -110,7 +113,7 @@ def solve_omt_with_decider(
         )
     stats["weighted rlimit"] = weighted_rlimit
 
-    stats["solver rlimit"] = solver_rlimit
+    # stats["solver rlimit"] = solver_rlimit
     stats["decider factory rlimit"] = decider_factory_rlimit
     stats["model base rlimit"] = model_rlimit[0]
     stats["model cut rlimit"] = sum(model_rlimit) - model_rlimit[0]
@@ -120,4 +123,44 @@ def solve_omt_with_decider(
     return stats
 
 
-__all__ = ["solve_omt_with_decider"]
+def solve_native(
+    hard,
+    obj,
+    sense: Sense,
+    max_rlimit: int = -1,
+):
+    ctx = z3.Context()
+    o = z3.Optimize(ctx=ctx)
+    if max_rlimit > 0:
+        o.set("rlimit", max_rlimit)
+
+    def _translate(expr, dst_ctx):
+        return z3.ExprRef(
+            z3.Z3_translate(expr.ctx.ref(), expr.as_ast(), dst_ctx.ref()),
+            dst_ctx,
+        )
+
+    hard_iso = [_translate(h, ctx) for h in hard]
+    obj_iso = _translate(obj, ctx)
+    o.add(*hard_iso)
+    if sense is Sense.MIN:
+        o.minimize(obj_iso)
+    else:
+        o.maximize(obj_iso)
+    res = o.check()
+    if res != z3.sat:
+        return {
+            "value": None,
+            "rlimit": o.statistics().get_key_value("rlimit count"),
+        }
+    m = o.model()
+    return {
+        "value": _num(m.eval(obj_iso, model_completion=True)),
+        "rlimit": o.statistics().get_key_value("rlimit count"),
+    }
+
+
+__all__ = [
+    "solve_omt_with_decider",
+    "solve_native",
+]
