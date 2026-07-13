@@ -23,7 +23,7 @@ from omt_branching.solver.extractor import Extraction, Handle, Z3SnapshotExtract
 from omt_branching.solver.strategy import (
     BaselineStrategy, NeuralStrategy, NumericHeuristicStrategy, StrategyConfig,
 )
-from omt_branching.solver.bridge import BridgeConfig, NeuralGOMTSolver, solve_native
+from omt_branching.solver.bridge import BridgeConfig, NeuralGOMTSolver
 from omt_branching.solver.rl import (
     RLConfig, RLEpisode, RLRecordingStrategy, RLStep, SolverInLoopRLTrainer,
     solve_and_measure,
@@ -42,7 +42,7 @@ from omt_branching.solver.propagator_snapshot import (
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider
-from omt_branching.solver.decide_omt import solve_omt_with_decider
+from omt_branching.solver.decide_omt import solve_omt_with_decider, solve_native
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat, generate_hard_smt_lia
 from omt_branching.solver.sat_solve import solve_sat_with_decider
 from omt_branching.solver.strong_branch import (
@@ -77,7 +77,6 @@ __all__ = [
     # 门面
     "NeuralGOMTSolver",
     "BridgeConfig",
-    "solve_native",
     # Solver-in-the-Loop 强化学习
     "SolverInLoopRLTrainer",
     "RLConfig",
@@ -117,6 +116,7 @@ __all__ = [
     "LearnedDecidePropagator",
     "PolicyDecider",
     "solve_omt_with_decider",
+    "solve_native",
     "generate_php",
     "generate_rand_3sat",
     "generate_hard_smt_lia",

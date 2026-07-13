@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from omt_branching.graph.hetero_graph import HeteroGraph
 from omt_branching.model.policy import BranchingPolicy, PolicyOutput
 
+from tqdm import tqdm
 
 @dataclass
 class RankingExample:
@@ -83,22 +84,24 @@ class ImitationTrainer:
             log_every: int = 0) -> list[dict[str, float]]:
         examples = list(examples)
         history: list[dict[str, float]] = []
-        for ep in range(epochs):
-            agg: dict[str, float] = {}
-            self.opt.zero_grad()
-            for i, ex in enumerate(examples):
-                parts, loss_tensor = self.train_step(ex, backward=False)
-                (loss_tensor / self.config.accum_steps).backward()
-                for k, v in parts.items():
-                    agg[k] = agg.get(k, 0.0) + v
-                if (i + 1) % self.config.accum_steps == 0 or (i + 1) == len(examples):
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
-                    self.opt.step()
-                    self.opt.zero_grad()
-                if log_every and (i + 1) % log_every == 0:
-                    print(f"[epoch {ep} step {i + 1}] loss={parts['loss']:.4f}")
-            n = max(1, len(examples))
-            history.append({k: v / n for k, v in agg.items()})
+        with tqdm(total = epochs * len(examples), desc="imit_train") as pbar:
+            for ep in range(epochs):
+                agg: dict[str, float] = {}
+                self.opt.zero_grad()
+                for i, ex in enumerate(examples):
+                    parts, loss_tensor = self.train_step(ex, backward=False)
+                    (loss_tensor / self.config.accum_steps).backward()
+                    for k, v in parts.items():
+                        agg[k] = agg.get(k, 0.0) + v
+                    if (i + 1) % self.config.accum_steps == 0 or (i + 1) == len(examples):
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+                        self.opt.step()
+                        self.opt.zero_grad()
+                    if log_every and (i + 1) % log_every == 0:
+                        print(f"[epoch {ep} step {i + 1}] loss={parts['loss']:.4f}")
+                    pbar.update(1)
+                n = max(1, len(examples))
+                history.append({k: v / n for k, v in agg.items()})
         return history
 
     # ------------------------------------------------------------------ #

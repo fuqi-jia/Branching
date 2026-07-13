@@ -19,6 +19,7 @@ from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator_snapshot import build_bool_snapshot
 
+from tqdm import tqdm
 
 class SamplingPolicyDecider:
     def __init__(self, policy: BranchingPolicy, defer_logit, assertions,
@@ -169,16 +170,18 @@ class DecideRLTrainer:
     def train(self, instances, iterations: int = 1, log: bool = False):
         instances = list(instances)
         history = []
-        for it in range(iterations):
-            for j, (hard, obj, sense) in enumerate(instances):
-                steps, reward, res = self.collect(hard, obj, sense)
-                stats = self.update(steps, reward, key=j)
-                stats.update({"iter": it, "instance": j, "rlimit": res["rlimit"],
-                              "conflicts": res["conflicts"]})
-                history.append(stats)
-                if log:
-                    print(f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
-                          f"rlimit={res['rlimit']} conflicts={res['conflicts']} steps={stats['steps']}")
+        with tqdm(total=iterations * len(instances), desc="rl_train") as pbar:
+            for it in range(iterations):
+                for j, (hard, obj, sense) in enumerate(instances):
+                    steps, reward, res = self.collect(hard, obj, sense)
+                    stats = self.update(steps, reward, key=j)
+                    stats.update({"iter": it, "instance": j, "rlimit": res["rlimit"],
+                                "conflicts": res["conflicts"]})
+                    history.append(stats)
+                    if log:
+                        print(f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
+                            f"rlimit={res['rlimit']} conflicts={res['conflicts']} steps={stats['steps']}")
+                    pbar.update(1)
         return history
 
 

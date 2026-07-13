@@ -35,8 +35,11 @@ class BridgeConfig:
 class NeuralGOMTSolver:
     """Neural 策略驱动的 GOMT OMT 求解器门面。"""
 
-    def __init__(self, service: Optional[BranchingPolicyService] = None,
-                 config: BridgeConfig = BridgeConfig()):
+    def __init__(
+        self,
+        service: Optional[BranchingPolicyService] = None,
+        config: BridgeConfig = BridgeConfig(),
+    ):
         self.service = service
         self.config = config
 
@@ -48,18 +51,25 @@ class NeuralGOMTSolver:
         - ``sense``：``Sense.MIN`` / ``Sense.MAX``。
         """
         backend = Z3Backend()
-        problem = GOMTProblem(hard_list=tuple(hard_list), objective=objective, sense=sense)
+        problem = GOMTProblem(
+            hard_list=tuple(hard_list), objective=objective, sense=sense
+        )
         if self.config.strategy == "baseline":
             strategy = BaselineStrategy(problem)
         else:
             strategy = NeuralStrategy(problem, self.service or BranchingPolicyService())
         solver = GOMTSolver(
-            problem, backend, strategy,
-            GOMTConfig(max_steps=self.config.max_steps, f_sat_mode=self.config.f_sat_mode),
+            problem,
+            backend,
+            strategy,
+            GOMTConfig(
+                max_steps=self.config.max_steps, f_sat_mode=self.config.f_sat_mode
+            ),
         )
         return solver.run()
 
 
+'''
 def solve_native(hard_list, objective, sense: Sense) -> Value:
     """参照 oracle：z3 原生 ``Optimize`` 的最优值。"""
     backend = Z3Backend()
@@ -67,6 +77,11 @@ def solve_native(hard_list, objective, sense: Sense) -> Value:
     if result is None:
         raise ValueError("native optimize: 硬约束不可满足")
     return result[1]
+'''
 
 
-__all__ = ["NeuralGOMTSolver", "BridgeConfig", "solve_native"]
+__all__ = [
+    "NeuralGOMTSolver",
+    "BridgeConfig",
+    # "solve_native",
+]

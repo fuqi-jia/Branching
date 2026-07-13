@@ -8,24 +8,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 
 import torch
 
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.service import BranchingPolicyService
 from omt_branching.solver import (
-    Z3Backend,
+    # Z3Backend,
     generate_bool_lia_dataset,
     solve_native,
     solve_omt_with_decider,
 )
 from omt_branching.solver.policy_decider import PolicyDecider
 
-
-def _native_rlimit(hard, obj, sense):
-    b = Z3Backend()
-    b.optimize(b.conjoin(*hard), obj, sense)
-    return b.rlimit_count
+from tqdm import tqdm
 
 
 def main() -> None:
@@ -84,7 +81,7 @@ def main() -> None:
         "native": {"rlimit": 0.0},
         "vsids": {
             "rlimit": 0.0,
-            "solver rlimit": 0.0,
+            # "solver rlimit": 0.0,
             "decider factory rlimit": 0.0,
             "model base rlimit": 0.0,
             "model cut rlimit": 0.0,
@@ -96,7 +93,7 @@ def main() -> None:
         },
         "learned": {
             "rlimit": 0.0,
-            "solver rlimit": 0.0,
+            # "solver rlimit": 0.0,
             "decider factory rlimit": 0.0,
             "model base rlimit": 0.0,
             "model cut rlimit": 0.0,
@@ -108,40 +105,42 @@ def main() -> None:
             "match": 0.0,
         },
     }
-    for inst in insts:
-        hard, obj, sense = inst.as_tuple()
-        native = solve_native(hard, obj, sense)
-        agg["native"]["rlimit"] += _native_rlimit(hard, obj, sense)
-        v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
-        agg["vsids"]["rlimit"] += v["rlimit"]
-        agg["vsids"]["solver rlimit"] += v["solver rlimit"]
-        agg["vsids"]["decider factory rlimit"] += v["decider factory rlimit"]
-        agg["vsids"]["model base rlimit"] += v["model base rlimit"]
-        agg["vsids"]["model cut rlimit"] += v["model cut rlimit"]
-        agg["vsids"]["check rlimit"] += v["check rlimit"]
-        agg["vsids"]["eval rlimit"] += v["eval rlimit"]
-        agg["vsids"]["weighted rlimit"] += v["weighted rlimit"]
-        agg["vsids"]["conflicts"] += v["conflicts"]
-        agg["vsids"]["match"] += 1.0 if v["value"] == native else 0.0
-        ln = solve_omt_with_decider(
-            hard,
-            obj,
-            sense,
-            decider_factory=lambda a: PolicyDecider(svc, a, args.refocus),
-        )
-        agg["learned"]["rlimit"] += ln["rlimit"]
-        agg["learned"]["solver rlimit"] += ln["solver rlimit"]
-        agg["learned"]["decider factory rlimit"] += ln["decider factory rlimit"]
-        agg["learned"]["model base rlimit"] += ln["model base rlimit"]
-        agg["learned"]["model cut rlimit"] += ln["model cut rlimit"]
-        agg["learned"]["check rlimit"] += ln["check rlimit"]
-        agg["learned"]["eval rlimit"] += ln["eval rlimit"]
-        agg["learned"]["weighted rlimit"] += ln["weighted rlimit"]
-        agg["learned"]["conflicts"] += ln["conflicts"]
-        agg["learned"]["decisions"] += ln["decisions"]
-        agg["learned"]["match"] += 1.0 if ln["value"] == native else 0.0
+    skipped = 0
+    with tqdm(total=len(insts), desc="test") as pbar:
+        for inst in insts:
+            hard, obj, sense = inst.as_tuple()
+            if h:
+                rewards = [col["reward"] for col in h]
+                rlimit_max = math.exp(-min(rewards))-1
+                rlimit_bound = int(rlimit_max * 100)
+            else:
+                rlimit_bound = -1
+            nat = solve_native(hard, obj, sense, max_rlimit=rlimit_bound)
+            if nat["value"] is None:
+                skipped += 1
+                pbar.update(1)
+                continue
+            agg["native"]["rlimit"] += nat["rlimit"]
+            v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
+            for key in v.keys():
+                if key not in agg["vsids"]:
+                    continue
+                agg["vsids"][key] += v[key]
+            agg["vsids"]["match"] += 1.0 if v["value"] == nat["value"] else 0.0
+            ln = solve_omt_with_decider(
+                hard,
+                obj,
+                sense,
+                decider_factory=lambda a: PolicyDecider(svc, a, args.refocus),
+            )
+            for key in ln.keys():
+                if key not in agg["learned"]:
+                    continue
+                agg["learned"][key] += ln[key]
+            agg["learned"]["match"] += 1.0 if ln["value"] == nat["value"] else 0.0
+            pbar.update(1)
 
-    n = max(1, len(insts))
+    n = max(1, len(insts)) - skipped
     print(
         f"=== 三臂对比（{len(insts)} 实例，未训练 GNN；rlimit/conflicts 越小越好，match=1 为正确）==="
     )
@@ -163,10 +162,10 @@ def main() -> None:
     #     "\nPhase 1 目标：learned 臂 match=1（管道正确）+ 可测量。Phase 2 再训练使其优于 VSIDS。"
     # )
     agg["native"]["rlimit"] /= n
-    for key, value in agg["vsids"].items():
-        value /= n
-    for key, value in agg["learned"].items():
-        value /= n
+    for key in agg["vsids"].keys():
+        agg["vsids"][key] /= n
+    for key in agg["learned"].keys():
+        agg["learned"][key] /= n
     with open("examples/artifacts/results.json", "w") as f:
         json.dump(agg, f, indent=4)
 
