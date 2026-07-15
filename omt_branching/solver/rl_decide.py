@@ -7,6 +7,8 @@ log-prob。奖励 = −log1p(rlimit)，per-instance EMA baseline。
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,11 +25,25 @@ from omt_branching.solver.propagator_snapshot import build_bool_snapshot
 
 from tqdm import tqdm
 
-DEFAULT_RL_COLLECT_WORKERS = 12
+DEFAULT_RL_COLLECT_WORKERS = 4
+MIN_INSTANCES_FOR_RL_PARALLEL = 8
 
 
 def _policy_state_cpu(policy: BranchingPolicy) -> dict:
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
+
+
+def effective_rl_workers(
+    count: int,
+    requested: int,
+    *,
+    min_instances: int = MIN_INSTANCES_FOR_RL_PARALLEL,
+) -> int:
+    """小批量或 requested<=1 时退回串行，避免进程启动开销超过 z3 收益。"""
+    if requested <= 1 or count < min_instances:
+        return 1
+    cpus = os.cpu_count() or 1
+    return max(1, min(requested, count, cpus))
 
 
 def _steps_to_cpu(steps) -> list:
@@ -99,10 +115,17 @@ class DecideRLConfig:
     grad_clip: float = 5.0
     device: str = field(default_factory=gnn_device)
     workers: int = 1
+    min_instances_for_parallel: int = MIN_INSTANCES_FOR_RL_PARALLEL
+
+
+def _make_rl_process_pool(workers: int) -> ProcessPoolExecutor:
+    """Linux 上必须用 spawn：父进程已 init CUDA 时 fork 会导致子进程卡死。"""
+    ctx = mp.get_context("spawn")
+    return ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
 
 
 def _rl_collect_worker(task: tuple) -> tuple:
-    """ProcessPool worker：按 index/seed 重建实例并 collect（独立 z3 Context）。"""
+    """ProcessPool worker：按 index/seed 重建实例并 collect（独立 z3 Context，GNN 在 CPU）。"""
     (
         inst_idx,
         seed,
@@ -143,7 +166,11 @@ def _rl_collect_worker(task: tuple) -> tuple:
         return d
 
     res = solve_omt_with_decider(
-        hard_exprs, obj, sense, decider_factory=factory, max_iters=max_iters
+        hard_exprs,
+        obj,
+        sense,
+        decider_factory=factory,
+        max_iters=max_iters,
     )
     steps = holder["d"].steps if "d" in holder else []
     reward = -math.log1p(res["weighted rlimit"])
@@ -205,13 +232,14 @@ class DecideRLTrainer:
         hard: bool,
         min_vars: int,
         max_vars: int,
-        workers: int,
+        pool: ProcessPoolExecutor,
+        pbar=None,
+        iter_idx: int = 0,
     ) -> list[tuple[int, list, float, dict]]:
-        """多进程 collect；返回按 inst_idx 排序的 (idx, steps, reward, res)。"""
-        n_workers = max(1, min(workers, count))
-        worker_device = self.config.device if n_workers == 1 else "cpu"
+        """多进程 collect；worker 固定 CPU，主进程 update 阶段再用 GPU。"""
         policy_state = _policy_state_cpu(self.policy)
         defer_val = float(self.defer_logit.detach().cpu())
+        worker_device = "cpu"
         tasks = [
             (
                 j,
@@ -228,10 +256,14 @@ class DecideRLTrainer:
             for j in range(count)
         ]
         results: list[tuple[int, list, float, dict]] = []
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_rl_collect_worker, t): t[0] for t in tasks}
-            for fut in as_completed(futures):
-                results.append(fut.result())
+        futures = [pool.submit(_rl_collect_worker, t) for t in tasks]
+        done = 0
+        for fut in as_completed(futures):
+            results.append(fut.result())
+            done += 1
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(iter=iter_idx, phase="collect", inst=f"{done}/{count}")
         results.sort(key=lambda x: x[0])
         return results
 
@@ -317,61 +349,83 @@ class DecideRLTrainer:
         collect_min_vars: int = 5,
         collect_max_vars: int = 7,
     ):
-        """REINFORCE 训练。``workers>1`` 时用进程池并行 collect（按 seed/index 重建实例）。"""
+        """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。"""
         instances = list(instances)
         count = len(instances)
-        n_workers = workers if workers is not None else self.config.workers
+        requested = workers if workers is not None else self.config.workers
+        n_workers = effective_rl_workers(
+            count,
+            requested,
+            min_instances=self.config.min_instances_for_parallel,
+        )
+        use_parallel = n_workers > 1
         history = []
-        with tqdm(total=iterations * count, desc="rl_train") as pbar:
-            for it in range(iterations):
-                if n_workers > 1:
-                    batch = self._collect_parallel(
-                        count,
-                        seed=collect_seed,
-                        hard=collect_hard,
-                        min_vars=collect_min_vars,
-                        max_vars=collect_max_vars,
-                        workers=n_workers,
-                    )
-                    for j, steps, reward, res in batch:
-                        stats = self.update(steps, reward, key=j)
-                        stats.update({
-                            "iter": it,
-                            "instance": j,
-                            "rlimit": res["rlimit"],
-                            "conflicts": res["conflicts"],
-                        })
-                        history.append(stats)
-                        if log:
-                            print(
-                                f"[it {it} inst {j}] loss={stats['loss']:.4f} "
-                                f"reward={reward:.3f} rlimit={res['rlimit']} "
-                                f"conflicts={res['conflicts']} steps={stats['steps']}"
+        pool: ProcessPoolExecutor | None = None
+        if use_parallel:
+            pool = _make_rl_process_pool(n_workers)
+        try:
+            with tqdm(total=iterations * count, desc="rl_train") as pbar:
+                for it in range(iterations):
+                    if use_parallel:
+                        assert pool is not None
+                        batch = self._collect_parallel(
+                            count,
+                            seed=collect_seed,
+                            hard=collect_hard,
+                            min_vars=collect_min_vars,
+                            max_vars=collect_max_vars,
+                            pool=pool,
+                            pbar=pbar,
+                            iter_idx=it,
+                        )
+                        for upd_i, (j, steps, reward, res) in enumerate(batch):
+                            stats = self.update(steps, reward, key=j)
+                            stats.update({
+                                "iter": it,
+                                "instance": j,
+                                "rlimit": res["rlimit"],
+                                "conflicts": res["conflicts"],
+                            })
+                            history.append(stats)
+                            if log:
+                                print(
+                                    f"[it {it} inst {j}] loss={stats['loss']:.4f} "
+                                    f"reward={reward:.3f} rlimit={res['rlimit']} "
+                                    f"conflicts={res['conflicts']} steps={stats['steps']}"
+                                )
+                            pbar.set_postfix(
+                                iter=it,
+                                phase="update",
+                                inst=f"{upd_i + 1}/{count}",
                             )
-                        pbar.update(1)
-                else:
-                    for j, (hard, obj, sense) in enumerate(instances):
-                        steps, reward, res = self.collect(hard, obj, sense)
-                        stats = self.update(steps, reward, key=j)
-                        stats.update({
-                            "iter": it,
-                            "instance": j,
-                            "rlimit": res["rlimit"],
-                            "conflicts": res["conflicts"],
-                        })
-                        history.append(stats)
-                        if log:
-                            print(
-                                f"[it {it} inst {j}] loss={stats['loss']:.4f} "
-                                f"reward={reward:.3f} rlimit={res['rlimit']} "
-                                f"conflicts={res['conflicts']} steps={stats['steps']}"
-                            )
-                        pbar.update(1)
+                    else:
+                        for j, (hard, obj, sense) in enumerate(instances):
+                            steps, reward, res = self.collect(hard, obj, sense)
+                            stats = self.update(steps, reward, key=j)
+                            stats.update({
+                                "iter": it,
+                                "instance": j,
+                                "rlimit": res["rlimit"],
+                                "conflicts": res["conflicts"],
+                            })
+                            history.append(stats)
+                            if log:
+                                print(
+                                    f"[it {it} inst {j}] loss={stats['loss']:.4f} "
+                                    f"reward={reward:.3f} rlimit={res['rlimit']} "
+                                    f"conflicts={res['conflicts']} steps={stats['steps']}"
+                                )
+                            pbar.update(1)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
         return history
 
 
 __all__ = [
     "DEFAULT_RL_COLLECT_WORKERS",
+    "MIN_INSTANCES_FOR_RL_PARALLEL",
+    "effective_rl_workers",
     "SamplingPolicyDecider",
     "DecideRLConfig",
     "DecideRLTrainer",

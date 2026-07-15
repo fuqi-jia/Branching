@@ -77,8 +77,11 @@ def test_decide_rl_parallel_collect():
     from omt_branching.solver import generate_bool_lia_dataset
     from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
 
-    insts = generate_bool_lia_dataset(4, seed=2, min_vars=5, max_vars=5)
-    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=40, workers=2))
+    insts = generate_bool_lia_dataset(8, seed=2, min_vars=5, max_vars=5)
+    tr = DecideRLTrainer(
+        BranchingPolicy(),
+        DecideRLConfig(refocus_every=40, workers=2, min_instances_for_parallel=4),
+    )
     hist = tr.train(
         [i.as_tuple() for i in insts],
         iterations=1,
@@ -87,5 +90,5 @@ def test_decide_rl_parallel_collect():
         collect_min_vars=5,
         collect_max_vars=5,
     )
-    assert len(hist) == 4
+    assert len(hist) == 8
     assert all(h["steps"] >= 0 for h in hist)

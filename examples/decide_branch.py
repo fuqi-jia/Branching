@@ -20,6 +20,9 @@ from omt_branching.model.device import gnn_device
 from omt_branching.model.inference import InferenceConfig
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.service import BranchingPolicyService, ServiceConfig
+from omt_branching.solver.rl_decide import DEFAULT_RL_COLLECT_WORKERS
+from omt_branching.model.policy import BranchingPolicy
+from omt_branching.service import BranchingPolicyService, ServiceConfig
 from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
@@ -225,7 +228,13 @@ def main() -> None:
         "--test-workers",
         type=int,
         default=DEFAULT_TEST_WORKERS,
-        help=f"测试、look-ahead 与 RL collect 并发数（默认 {DEFAULT_TEST_WORKERS}）",
+        help=f"测试与 look-ahead 标签构建并发数（默认 {DEFAULT_TEST_WORKERS}）",
+    )
+    ap.add_argument(
+        "--rl-workers",
+        type=int,
+        default=DEFAULT_RL_COLLECT_WORKERS,
+        help="RL collect 进程数（默认 4；实例数<8 时自动串行；与 --test-workers 独立）",
     )
     ap.add_argument(
         "--device",
@@ -304,13 +313,18 @@ def main() -> None:
             f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
         )
     if args.rl_iters > 0:
-        from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+        from omt_branching.solver.rl_decide import (
+            DEFAULT_RL_COLLECT_WORKERS,
+            DecideRLConfig,
+            DecideRLTrainer,
+            effective_rl_workers,
+        )
 
         rl_count = max(args.train, 40)
         rl_train = gen(
             rl_count, seed=1, min_vars=args.min_vars, max_vars=args.max_vars
         )
-        rl_workers = args.test_workers
+        rl_workers = effective_rl_workers(rl_count, args.rl_workers)
         rlt = DecideRLTrainer(
             policy,
             DecideRLConfig(
@@ -319,7 +333,11 @@ def main() -> None:
                 workers=rl_workers,
             ),
         )
-        print(f"RL collect: {rl_count} 实例 × {args.rl_iters} 轮, workers={rl_workers}")
+        mode = f"并行×{rl_workers}" if rl_workers > 1 else "串行(GPU collect)"
+        print(
+            f"RL collect: {rl_count} 实例 × {args.rl_iters} 轮, {mode} "
+            f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}"
+        )
         h = rlt.train(
             [i.as_tuple() for i in rl_train],
             iterations=args.rl_iters,
