@@ -10,13 +10,16 @@ import argparse
 import json
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from fractions import Fraction
 
 import torch
 
+from omt_branching.model.device import gnn_device
+from omt_branching.model.inference import InferenceConfig
 from omt_branching.model.policy import BranchingPolicy
-from omt_branching.service import BranchingPolicyService
+from omt_branching.service import BranchingPolicyService, ServiceConfig
 from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
@@ -31,6 +34,7 @@ from tqdm import tqdm
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+DEFAULT_TEST_WORKERS = 12
 
 
 def _json_value(v):
@@ -79,6 +83,117 @@ def _stats_for_json(stats: dict) -> dict:
     return {k: _json_value(v) for k, v in stats.items()}
 
 
+def _regenerate_test_instance(
+    index: int,
+    seed: int,
+    *,
+    hard: bool,
+    min_vars: int,
+    max_vars: int,
+) -> OMTInstance:
+    """复现 ``gen(count=index+1, seed=seed)[index]``（供进程池 worker 独立 z3 上下文）。"""
+    from omt_branching.solver import (
+        generate_bool_lia_dataset,
+        generate_hard_bool_lia_dataset,
+    )
+
+    gen = generate_hard_bool_lia_dataset if hard else generate_bool_lia_dataset
+    return gen(index + 1, seed=seed, min_vars=min_vars, max_vars=max_vars)[index]
+
+
+def _eval_test_worker(task: tuple) -> dict:
+    """ProcessPool worker：按 index/seed 重建实例并跑三臂评测。"""
+    (
+        index,
+        seed,
+        hard,
+        min_vars,
+        max_vars,
+        policy_state,
+        device,
+        z3_path,
+        binary_timeout,
+        refocus,
+    ) = task
+    inst = _regenerate_test_instance(
+        index, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
+    )
+    hard, obj, sense = inst.as_tuple()
+    ref = solve_binary(inst, z3_path=z3_path, timeout_s=binary_timeout)
+    ref_val = ref.get("value")
+    v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
+    policy = BranchingPolicy()
+    policy.load_state_dict(policy_state)
+    policy.to(device)
+    policy.eval()
+    svc = BranchingPolicyService(
+        policy=policy,
+        config=ServiceConfig(inference=InferenceConfig(device=device)),
+    )
+    ln = solve_omt_with_decider(
+        hard,
+        obj,
+        sense,
+        decider_factory=lambda a: PolicyDecider(svc, a, refocus),
+    )
+    return {
+        "instance_id": inst.instance_id,
+        "ref_val": ref_val,
+        "binary": ref,
+        "vsids": v,
+        "learned": ln,
+    }
+
+
+def _policy_state_cpu(policy: BranchingPolicy) -> dict:
+    return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
+
+
+def _run_test_parallel(
+    insts: list[OMTInstance],
+    policy: BranchingPolicy,
+    device: str,
+    z3_path: str,
+    binary_timeout: int,
+    refocus: int,
+    workers: int,
+    *,
+    test_seed: int,
+    hard: bool,
+    min_vars: int,
+    max_vars: int,
+) -> list[dict]:
+    """并发跑测试集（进程池；每 worker 独立 z3 上下文）。"""
+    policy_state = _policy_state_cpu(policy)
+    n_workers = max(1, min(workers, len(insts)))
+    # 多进程并发时 GNN 推理走 CPU，避免多进程同时占用同一块 GPU
+    worker_device = device if n_workers == 1 else "cpu"
+    tasks = [
+        (
+            i,
+            test_seed,
+            hard,
+            min_vars,
+            max_vars,
+            policy_state,
+            worker_device,
+            z3_path,
+            binary_timeout,
+            refocus,
+        )
+        for i in range(len(insts))
+    ]
+    by_id: dict[str, dict] = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_eval_test_worker, t): t[0] for t in tasks}
+        with tqdm(total=len(insts), desc="test") as pbar:
+            for fut in as_completed(futures):
+                row = fut.result()
+                by_id[row["instance_id"]] = row
+                pbar.update(1)
+    return [by_id[inst.instance_id] for inst in insts]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="UserPropagator 学习分支三臂对比（binary 参考）")
     ap.add_argument("--test", type=int, default=20)
@@ -108,7 +223,21 @@ def main() -> None:
         default=1200,
         help="单实例 z3 二进制超时（秒）",
     )
+    ap.add_argument(
+        "--test-workers",
+        type=int,
+        default=DEFAULT_TEST_WORKERS,
+        help=f"测试阶段并发实例数（默认 {DEFAULT_TEST_WORKERS}）",
+    )
+    ap.add_argument(
+        "--device",
+        default=None,
+        help="GNN 设备（默认 cuda 可用则 cuda，否则 cpu）",
+    )
     args = ap.parse_args()
+
+    device = args.device or gnn_device()
+    print(f"GNN device: {device}")
 
     z3_path = args.z3_path or shutil.which("z3")
     if not z3_path:
@@ -156,7 +285,7 @@ def main() -> None:
             )
             print(f"训练集 {len(train_insts)} 个实例已保存 -> {args.dataset_dir}/train/")
         exs = [e for e in build_lookahead_examples(train_insts) if e.bool_target_scores]
-        hist = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(
+        hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
             exs, epochs=args.epochs
         )
         print(
@@ -169,7 +298,9 @@ def main() -> None:
         rl_train = gen(
             max(args.train, 40), seed=1, min_vars=args.min_vars, max_vars=args.max_vars
         )
-        rlt = DecideRLTrainer(policy, DecideRLConfig(refocus_every=args.refocus))
+        rlt = DecideRLTrainer(
+            policy, DecideRLConfig(refocus_every=args.refocus, device=device)
+        )
         h = rlt.train(
             [i.as_tuple() for i in rl_train], iterations=args.rl_iters, log=False
         )
@@ -178,7 +309,6 @@ def main() -> None:
                 f"RL 微调: {len(h)} 步, 末条 reward={h[-1]['reward']:.3f} "
                 f"conflicts={h[-1]['conflicts']}, defer_logit={float(rlt.defer_logit):.3f}"
             )
-    svc = BranchingPolicyService(policy=policy)
 
     agg = {
         "binary": {"rlimit": 0.0, "time_ms": 0.0},
@@ -209,39 +339,42 @@ def main() -> None:
         },
     }
     per_instance: list[dict] = []
-    with tqdm(total=len(insts), desc="test") as pbar:
-        for inst in insts:
-            hard, obj, sense = inst.as_tuple()
-            ref = solve_binary(
-                inst, z3_path=z3_path, timeout_s=args.binary_timeout
-            )
-            ref_val = ref.get("value")
-            agg["binary"]["rlimit"] += ref.get("rlimit") or 0
-            agg["binary"]["time_ms"] += ref.get("time_ms") or 0.0
-            v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
-            for key in v.keys():
-                if key not in agg["vsids"]:
-                    continue
-                agg["vsids"][key] += v[key]
-            agg["vsids"]["match"] += 1.0 if v["value"] == ref_val else 0.0
-            ln = solve_omt_with_decider(
-                hard,
-                obj,
-                sense,
-                decider_factory=lambda a: PolicyDecider(svc, a, args.refocus),
-            )
-            for key in ln.keys():
-                if key not in agg["learned"]:
-                    continue
-                agg["learned"][key] += ln[key]
-            agg["learned"]["match"] += 1.0 if ln["value"] == ref_val else 0.0
-            per_instance.append({
-                "instance_id": inst.instance_id,
-                "binary": _stats_for_json(ref),
-                "vsids": _stats_for_json(v),
-                "learned": _stats_for_json(ln),
-            })
-            pbar.update(1)
+    rows = _run_test_parallel(
+        insts,
+        policy,
+        device,
+        z3_path,
+        args.binary_timeout,
+        args.refocus,
+        args.test_workers,
+        test_seed=99,
+        hard=args.hard,
+        min_vars=args.min_vars,
+        max_vars=args.max_vars,
+    )
+    for row in rows:
+        ref_val = row["ref_val"]
+        ref = row["binary"]
+        v = row["vsids"]
+        ln = row["learned"]
+        agg["binary"]["rlimit"] += ref.get("rlimit") or 0
+        agg["binary"]["time_ms"] += ref.get("time_ms") or 0.0
+        for key in v.keys():
+            if key not in agg["vsids"]:
+                continue
+            agg["vsids"][key] += v[key]
+        agg["vsids"]["match"] += 1.0 if v["value"] == ref_val else 0.0
+        for key in ln.keys():
+            if key not in agg["learned"]:
+                continue
+            agg["learned"][key] += ln[key]
+        agg["learned"]["match"] += 1.0 if ln["value"] == ref_val else 0.0
+        per_instance.append({
+            "instance_id": row["instance_id"],
+            "binary": _stats_for_json(ref),
+            "vsids": _stats_for_json(v),
+            "learned": _stats_for_json(ln),
+        })
 
     n = max(1, len(insts))
     print(
@@ -277,6 +410,8 @@ def main() -> None:
         "summary": agg,
         "n_instances": len(insts),
         "z3_path": z3_path,
+        "device": device,
+        "test_workers": args.test_workers,
         "per_instance": per_instance,
     }
     results_path = os.path.join(ARTIFACTS, "results.json")

@@ -7,11 +7,12 @@ log-prob。奖励 = −log1p(rlimit)，per-instance EMA baseline。
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
+from omt_branching.model.device import gnn_device
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
 from omt_branching.interfaces import NodeType
 from omt_branching.model.policy import BranchingPolicy
@@ -72,7 +73,7 @@ class DecideRLConfig:
     max_iters: int = 100000
     baseline_momentum: float = 0.9
     grad_clip: float = 5.0
-    device: str = "cpu"
+    device: str = field(default_factory=gnn_device)
 
 
 class DecideRLTrainer:

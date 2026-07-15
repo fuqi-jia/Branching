@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+
+from omt_branching.model.device import gnn_device
 
 from omt_branching.graph.hetero_graph import HeteroGraph
 from omt_branching.interfaces import NodeType
@@ -24,7 +26,7 @@ from omt_branching.model.policy import BranchingPolicy, PolicyOutput
 
 @dataclass
 class InferenceConfig:
-    device: str = "cpu"
+    device: str = field(default_factory=gnn_device)
     max_total_nodes: int = 200_000     # 超过则跳过推理直接回退
     time_budget_ms: Optional[float] = None  # 超时标记 fallback；None=不限
     min_confidence: float = 0.0        # top-1 候选概率门限

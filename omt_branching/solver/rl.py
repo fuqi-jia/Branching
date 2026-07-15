@@ -32,6 +32,7 @@ import torch
 from omt_branching.graph.hetero_graph import HeteroGraph
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
 from omt_branching.interfaces import NodeType
+from omt_branching.model.device import gnn_device
 from omt_branching.model.policy import BranchingPolicy, _masked_softmax
 from omt_branching.service import BranchingPolicyService
 from omt_branching.solver.calculus import GOMTConfig, GOMTResult, GOMTSolver
@@ -65,7 +66,7 @@ class RLConfig:
     entropy_coef: float = 1e-2       # 熵正则权重（鼓励探索）
     baseline_momentum: float = 0.9   # 移动平均 baseline 动量
     grad_clip: float = 5.0
-    device: str = "cpu"
+    device: str = field(default_factory=gnn_device)
 
     # 奖励塑形
     reward_scale: float = 1.0        # incumbent 提升的缩放

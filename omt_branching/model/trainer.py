@@ -15,6 +15,7 @@ from typing import Iterable, Optional
 import torch
 import torch.nn.functional as F
 
+from omt_branching.model.device import gnn_device
 from omt_branching.graph.hetero_graph import HeteroGraph
 from omt_branching.model.policy import BranchingPolicy, PolicyOutput
 
@@ -51,7 +52,7 @@ class TrainConfig:
     lambda_int: float = 1.0
     lambda_aux: float = 0.3
     grad_clip: float = 5.0
-    device: str = "cpu"
+    device: str = field(default_factory=gnn_device)
     accum_steps: int = 1  # 梯度累积步数，>1 时每 accum_steps 次 forward 才 backward 一次
 
 

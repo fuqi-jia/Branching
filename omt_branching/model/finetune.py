@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from omt_branching.graph.hetero_graph import HeteroGraph
+from omt_branching.model.device import gnn_device
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.model.trainer import ImitationTrainer, RankingExample, TrainConfig
 
@@ -47,7 +48,7 @@ class FinetuneConfig:
     entropy_coef: float = 1e-2
     baseline_momentum: float = 0.9
     grad_clip: float = 5.0
-    device: str = "cpu"
+    device: str = field(default_factory=gnn_device)
 
 
 class SolverInLoopFinetuner:
