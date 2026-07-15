@@ -70,3 +70,22 @@ def test_decide_rl_sat_collect_update():
     assert math.isfinite(reward)
     stats = tr.update(steps, reward, key=0)
     assert math.isfinite(stats["loss"])
+
+
+def test_decide_rl_parallel_collect():
+    """多进程 collect + 主进程 update。"""
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    insts = generate_bool_lia_dataset(4, seed=2, min_vars=5, max_vars=5)
+    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=40, workers=2))
+    hist = tr.train(
+        [i.as_tuple() for i in insts],
+        iterations=1,
+        workers=2,
+        collect_seed=2,
+        collect_min_vars=5,
+        collect_max_vars=5,
+    )
+    assert len(hist) == 4
+    assert all(h["steps"] >= 0 for h in hist)

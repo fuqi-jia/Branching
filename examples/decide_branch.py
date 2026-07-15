@@ -225,7 +225,7 @@ def main() -> None:
         "--test-workers",
         type=int,
         default=DEFAULT_TEST_WORKERS,
-        help=f"测试与 look-ahead 标签构建并发数（默认 {DEFAULT_TEST_WORKERS}）",
+        help=f"测试、look-ahead 与 RL collect 并发数（默认 {DEFAULT_TEST_WORKERS}）",
     )
     ap.add_argument(
         "--device",
@@ -306,14 +306,29 @@ def main() -> None:
     if args.rl_iters > 0:
         from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
 
+        rl_count = max(args.train, 40)
         rl_train = gen(
-            max(args.train, 40), seed=1, min_vars=args.min_vars, max_vars=args.max_vars
+            rl_count, seed=1, min_vars=args.min_vars, max_vars=args.max_vars
         )
+        rl_workers = args.test_workers
         rlt = DecideRLTrainer(
-            policy, DecideRLConfig(refocus_every=args.refocus, device=device)
+            policy,
+            DecideRLConfig(
+                refocus_every=args.refocus,
+                device=device,
+                workers=rl_workers,
+            ),
         )
+        print(f"RL collect: {rl_count} 实例 × {args.rl_iters} 轮, workers={rl_workers}")
         h = rlt.train(
-            [i.as_tuple() for i in rl_train], iterations=args.rl_iters, log=False
+            [i.as_tuple() for i in rl_train],
+            iterations=args.rl_iters,
+            log=False,
+            workers=rl_workers,
+            collect_seed=1,
+            collect_hard=args.hard,
+            collect_min_vars=args.min_vars,
+            collect_max_vars=args.max_vars,
         )
         if h:
             print(

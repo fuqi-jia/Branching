@@ -46,19 +46,26 @@ def solve_omt_with_decider(
     sense: Sense,
     decider_factory=None,
     max_iters: int = 100000,
+    ctx: z3.Context | None = None,
 ) -> dict:
-    s = z3.Solver()
+    """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。"""
+    if ctx is None:
+        ctx = z3.Context()
+    hard_iso = [h.translate(ctx) for h in hard]
+    obj_iso = objective.translate(ctx)
+
+    s = z3.Solver(ctx=ctx)
     solver_rlimit = _stat(s, "rlimit count")
     rlimit = solver_rlimit
     prop = None
     if decider_factory is not None:
-        atoms = collect_atoms(list(hard))
-        decider = decider_factory(list(hard))
+        atoms = collect_atoms(hard_iso)
+        decider = decider_factory(hard_iso)
         prop = LearnedDecidePropagator(s, atoms, decider)
     decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
     rlimit += decider_factory_rlimit
 
-    s.add(*hard)
+    s.add(*hard_iso)
     model_rlimit = [_stat(s, "rlimit count") - rlimit]
     rlimit += model_rlimit[-1]
 
@@ -68,7 +75,7 @@ def solve_omt_with_decider(
     rlimit += check_rlimit[-1]
 
     m = s.model()
-    best_val = m.eval(objective, model_completion=True)
+    best_val = m.eval(obj_iso, model_completion=True)
     eval_rlimit = [_stat(s, "rlimit count") - rlimit]
     rlimit += eval_rlimit[-1]
 
@@ -76,7 +83,7 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
-        cut = objective > best_val if sense is Sense.MAX else objective < best_val
+        cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)
         model_rlimit.append(_stat(s, "rlimit count") - rlimit)
         rlimit += model_rlimit[-1]
@@ -87,7 +94,7 @@ def solve_omt_with_decider(
         rlimit += check_rlimit[-1]
 
         m = s.model()
-        best_val = m.eval(objective, model_completion=True)
+        best_val = m.eval(obj_iso, model_completion=True)
         eval_rlimit.append(_stat(s, "rlimit count") - rlimit)
         rlimit += eval_rlimit[-1]
 

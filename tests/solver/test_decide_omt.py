@@ -14,8 +14,22 @@ def test_vsids_arm_matches_native():
     inst = generate_hard_lia_dataset(1, seed=5, min_vars=4, max_vars=4)[0]
     hard, obj, sense = inst.as_tuple()
     r = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
-    assert r["value"] == solve_native(hard, obj, sense)
+    assert r["value"] == solve_native(hard, obj, sense)["value"]
     assert r["decisions"] is None       # VSIDS 臂不挂 propagator
+
+
+def test_solve_omt_isolated_context_per_call():
+    """每次调用在独立 z3.Context 内求解，连续多实例互不干扰。"""
+    from omt_branching.solver import generate_bool_lia_dataset
+
+    insts = generate_bool_lia_dataset(3, seed=11, min_vars=4, max_vars=4)
+    values = []
+    for inst in insts:
+        hard, obj, sense = inst.as_tuple()
+        r = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
+        values.append(r["value"])
+    assert all(v is not None for v in values)
+    assert len(set(values)) >= 1
 
 
 def test_learned_arm_matches_native_and_fires():
@@ -25,7 +39,7 @@ def test_learned_arm_matches_native_and_fires():
     r = solve_omt_with_decider(
         hard, obj, sense,
         decider_factory=lambda a: PolicyDecider(svc, a, refocus_every=50))
-    assert r["value"] == solve_native(hard, obj, sense)   # 正确性：== native
+    assert r["value"] == solve_native(hard, obj, sense)["value"]   # 正确性：== native
     assert r["decisions"] is not None                     # propagator 在回路里生效
     assert r["rlimit"] > 0
 
