@@ -18,6 +18,7 @@ from typing import Optional
 
 import z3
 
+from omt_branching.solver.instance_gen import OMTInstance
 from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.propagator_snapshot import collect_atoms
@@ -160,54 +161,34 @@ def solve_native(
     }
 
 
-def _collect_vars(hard, obj) -> list:
-    """从硬约束与目标中收集算术变量（去重、按名排序）。"""
-    seen: dict[str, object] = {}
-
-    def visit(expr) -> None:
-        if z3.is_const(expr) and expr.decl().arity() == 0:
-            if z3.is_int(expr) or z3.is_real(expr):
-                seen[str(expr)] = expr
-        for child in expr.children():
-            visit(child)
-
-    for h in hard:
-        visit(h)
-    visit(obj)
-    return [seen[k] for k in sorted(seen)]
+def _instance_logic(inst: OMTInstance) -> str:
+    if inst.theory == "LRA":
+        return "QF_LRA"
+    if inst.family == "bool":
+        return "ALL"
+    return "QF_LIA"
 
 
-def _has_or(expr) -> bool:
-    if z3.is_or(expr):
-        return True
-    return any(_has_or(c) for c in expr.children())
+def _instance_var_sort(inst: OMTInstance) -> str:
+    return "Real" if inst.theory == "LRA" else "Int"
 
 
-def _smt_logic_and_sort(hard, variables: list) -> tuple[str, str]:
-    if any(z3.is_real(v) for v in variables):
-        return "QF_LRA", "Real"
-    if any(_has_or(h) for h in hard):
-        return "ALL", "Int"
-    return "QF_LIA", "Int"
-
-
-def _hard_to_smt2(hard, obj, sense: Sense) -> str:
-    """把 ``(hard, obj, sense)`` 编成 z3 二进制可读的 OMT SMT-LIB2。"""
-    variables = _collect_vars(hard, obj)
-    logic, var_sort = _smt_logic_and_sort(hard, variables)
-    obj_sexpr = obj.sexpr()
-    sense_cmd = "maximize" if sense is Sense.MAX else "minimize"
+def instance_to_smt2(inst: OMTInstance) -> str:
+    """将 ``OMTInstance`` 导出为 z3 二进制可读的 OMT SMT-LIB2（含 ``get-value``）。"""
+    obj = inst.objective.sexpr()
+    sense_cmd = "maximize" if inst.sense is Sense.MAX else "minimize"
+    var_sort = _instance_var_sort(inst)
     lines = [
-        f"(set-logic {logic})",
+        f"(set-logic {_instance_logic(inst)})",
         "(set-option :produce-models true)",
     ]
-    for v in variables:
+    for v in inst.variables:
         lines.append(f"(declare-fun {v.decl().name()} () {var_sort})")
-    for h in hard:
+    for h in inst.hard:
         lines.append(f"(assert {h.sexpr()})")
-    lines.append(f"({sense_cmd} {obj_sexpr})")
+    lines.append(f"({sense_cmd} {obj})")
     lines.append("(check-sat)")
-    lines.append(f"(get-value ({obj_sexpr}))")
+    lines.append(f"(get-value ({obj}))")
     return "\n".join(lines) + "\n"
 
 
@@ -227,15 +208,28 @@ def _parse_smt_num(token: str) -> Optional[Fraction]:
         return None
 
 
+def _parse_get_value_line(line: str) -> Optional[Fraction]:
+    """从单行 ``(get-value ...)`` 响应解析目标最优值。"""
+    line = line.strip()
+    if not line.startswith("(("):
+        return None
+    m = re.search(
+        r"\)\s+(\(\/\s+-?\d+\s+-?\d+\)|-?\d+)\s*\)\s*\)\s*$",
+        line,
+    )
+    if m is None:
+        return None
+    return _parse_smt_num(m.group(1))
+
+
 def _parse_get_value(stdout: str) -> Optional[Fraction]:
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("((("):
-            continue
-        m = re.search(r"\)\s+(\S+)\)\)$", line)
-        if m is None:
-            continue
-        return _parse_smt_num(m.group(1))
+    """从 z3 标准输出解析 ``(get-value ...)`` 的最优值。"""
+    # 统计块 ``(:rlimit-count ...`` 之前为求解输出
+    head = stdout.split("(:", 1)[0]
+    for line in head.splitlines():
+        val = _parse_get_value_line(line.strip())
+        if val is not None:
+            return val
     return None
 
 
@@ -253,23 +247,26 @@ def _parse_sat(stdout: str) -> str:
 
 
 def solve_binary(
-    hard,
-    obj,
-    sense: Sense,
+    inst: OMTInstance,
     *,
     z3_path: str | None = None,
     timeout_s: int = 120,
+    smt2: str | None = None,
 ) -> dict:
-    """用 z3 二进制（``z3 -st``）求解 OMT，返回 ``value``/``rlimit``（与 :func:`solve_native` 对齐）。"""
+    """用 z3 二进制（``z3 -st``）求解 OMT，返回 ``value``/``rlimit``。
+
+    SMT-LIB2 默认由 :func:`instance_to_smt2` 生成，与数据集落盘内容一致；
+    可传入 ``smt2`` 覆盖（例如复用已保存的 ``.smt2`` 文件内容）。
+    """
     exe = z3_path or shutil.which("z3")
     if not exe:
         raise FileNotFoundError("未找到 z3 二进制，请安装 z3 或通过 z3_path 指定")
 
-    smt2 = _hard_to_smt2(hard, obj, sense)
+    smt2_text = smt2 if smt2 is not None else instance_to_smt2(inst)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".smt2", delete=False, encoding="ascii"
     ) as tmp:
-        tmp.write(smt2)
+        tmp.write(smt2_text)
         path = tmp.name
     try:
         t0 = perf_counter()
@@ -292,19 +289,30 @@ def solve_binary(
         Path(path).unlink(missing_ok=True)
 
     stdout = proc.stdout or ""
+    stderr = (proc.stderr or "").strip()
     status = _parse_sat(stdout)
     rlimit = _parse_rlimit(stdout)
     value = _parse_get_value(stdout) if status == "sat" else None
+    if status == "sat" and value is None:
+        err_lines = [
+            ln.strip()
+            for ln in stdout.splitlines()
+            if ln.strip().startswith("(error")
+        ]
+        if err_lines:
+            stderr = "; ".join(err_lines) if not stderr else f"{stderr}; {'; '.join(err_lines)}"
     return {
         "value": value,
         "rlimit": rlimit,
         "time_ms": elapsed_ms,
         "status": status,
-        "stderr": (proc.stderr or "").strip(),
+        "stderr": stderr,
+        "returncode": proc.returncode,
     }
 
 
 __all__ = [
+    "instance_to_smt2",
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",

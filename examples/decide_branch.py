@@ -20,11 +20,11 @@ from omt_branching.service import BranchingPolicyService
 from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
+    instance_to_smt2,
     solve_binary,
     solve_omt_with_decider,
 )
 from omt_branching.solver.instance_gen import OMTInstance
-from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.policy_decider import PolicyDecider
 
 from tqdm import tqdm
@@ -39,25 +39,7 @@ def _json_value(v):
         return None
     if isinstance(v, Fraction):
         return str(v)
-    if isinstance(v, Sense):
-        return v.value
     return v
-
-
-def _instance_to_smt2(inst: OMTInstance) -> str:
-    """将 OMTInstance 导出为可人工核查的 SMT-LIB2 文本。"""
-    lines = ["(set-logic QF_LIA)"]
-    for v in inst.variables:
-        lines.append(f"(declare-fun {v} () Int)")
-    for h in inst.hard:
-        lines.append(f"(assert {h.sexpr()})")
-    obj = inst.objective.sexpr()
-    if inst.sense is Sense.MAX:
-        lines.append(f"(maximize {obj})")
-    else:
-        lines.append(f"(minimize {obj})")
-    lines.append("(check-sat)")
-    return "\n".join(lines) + "\n"
 
 
 def _instance_manifest_entry(inst: OMTInstance, *, smt2_relpath: str) -> dict:
@@ -88,7 +70,7 @@ def save_dataset(
         fname = f"{inst.instance_id}.smt2"
         relpath = os.path.join(split, fname).replace("\\", "/")
         with open(os.path.join(split_dir, fname), "w", encoding="utf-8") as f:
-            f.write(_instance_to_smt2(inst))
+            f.write(instance_to_smt2(inst))
         entries.append(_instance_manifest_entry(inst, smt2_relpath=relpath))
     return entries
 
@@ -231,7 +213,7 @@ def main() -> None:
         for inst in insts:
             hard, obj, sense = inst.as_tuple()
             ref = solve_binary(
-                hard, obj, sense, z3_path=z3_path, timeout_s=args.binary_timeout
+                inst, z3_path=z3_path, timeout_s=args.binary_timeout
             )
             ref_val = ref.get("value")
             agg["binary"]["rlimit"] += ref.get("rlimit") or 0
