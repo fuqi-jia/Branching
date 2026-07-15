@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
-DEFAULT_TEST_WORKERS = 12
+DEFAULT_TEST_WORKERS = 30
 
 
 def _json_value(v):

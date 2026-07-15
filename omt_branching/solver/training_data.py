@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from typing import Hashable, Optional
+from tqdm import tqdm
 
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
 from omt_branching.interfaces import NodeType
@@ -279,10 +280,12 @@ def build_lookahead_examples_parallel(
     slots: list[RankingExample | None] = [None] * count
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_lookahead_example_worker, t) for t in tasks]
-        for fut in as_completed(futures):
-            index, ex = fut.result()
-            if ex is not None:
-                slots[index] = ex
+        with tqdm(total=len(tasks), desc="lookahead") as pbar:
+            for fut in as_completed(futures):
+                index, ex = fut.result()
+                if ex is not None:
+                    slots[index] = ex
+                pbar.update(1)
     return [ex for ex in slots if ex is not None]
 
 
