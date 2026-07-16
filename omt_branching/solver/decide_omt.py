@@ -49,13 +49,11 @@ def solve_omt_with_decider(
     max_iters: int = 100000,
     ctx: z3.Context | None = None,
     *,
-    ref_value=None,
-    ref_rlimit: int | None = None,
+    ref_rlimit: int,
 ) -> dict:
     """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
-
-    ``ref_value`` / ``ref_rlimit``：可选的 z3 binary 参考最优值与 rlimit（来自数据集缓存），
-    原样写入返回字典，供 RL reward / match 计算使用；不参与搜索过程本身。
+    使用ref_rlimit剪枝, 当前消耗超出2 * reflimit 时可直接返回, 此时计算得到的reward为-2.0
+    weight_rlimit加权, 范围保证在(rlimit, 2 * rlimit)开区间内, 用于计算reward
     """
     if ctx is None:
         ctx = z3.Context()
@@ -91,6 +89,8 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
+        if rlimit - solver_rlimit > 2 * ref_rlimit:
+            break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)
         model_rlimit.append(_stat(s, "rlimit count") - rlimit)
@@ -106,7 +106,9 @@ def solve_omt_with_decider(
         eval_rlimit.append(_stat(s, "rlimit count") - rlimit)
         rlimit += eval_rlimit[-1]
 
-        records.append((_num(best_val), check_rlimit[-1] + eval_rlimit[-1]))
+        records.append(
+            (_num(best_val), model_rlimit[-1] + check_rlimit[-1] + eval_rlimit[-1])
+        )
 
     stats = {
         "value": _num(best_val),
@@ -120,18 +122,14 @@ def solve_omt_with_decider(
         "iters": iters,
     }
 
+    weighted_rlimit = stats["rlimit"]
     local, cost = records[0]
-    weighted_rlimit = len(records) * cost
+    weighted_rlimit += cost
     for i in range(1, len(records)):
         last_local = local
         local, cost = records[i]
         weighted_rlimit += (
-            # max(
-            #     (stats["value"] - last_local) / (local - last_local),
-            #     len(records) - i,
-            # )
-            (len(records) - i)
-            * cost
+            1.0 * cost * (stats["value"] - local) / (stats["value"] - last_local)
         )
     stats["weighted rlimit"] = weighted_rlimit
 
@@ -141,8 +139,6 @@ def solve_omt_with_decider(
     stats["model cut rlimit"] = sum(model_rlimit) - model_rlimit[0]
     stats["check rlimit"] = sum(check_rlimit)
     stats["eval rlimit"] = sum(eval_rlimit)
-    stats["ref_value"] = ref_value
-    stats["ref_rlimit"] = ref_rlimit
 
     return stats
 
@@ -243,8 +239,9 @@ def _extract_objective(text: str) -> tuple[Sense, str]:
       （``OMTInstance`` 仅支持单目标）。
     - ``<expr>`` 可跨多行，按括号配平提取。
     """
-    hits = [(m.group(1), m.start())
-            for m in re.finditer(r"\((maximize|minimize)\b", text)]
+    hits = [
+        (m.group(1), m.start()) for m in re.finditer(r"\((maximize|minimize)\b", text)
+    ]
     if not hits:
         raise ValueError("未找到 (maximize|minimize ...)：不是单目标 OMT 的 .smt2")
     if len(hits) > 1 or "assert-soft" in text:
@@ -264,9 +261,9 @@ def _extract_objective(text: str) -> tuple[Sense, str]:
                 break
     if end == -1:
         raise ValueError("(maximize|minimize ...) 括号不配平")
-    inner = text[start + 1 + len(cmd):end].strip()   # 去掉 "(cmd"
+    inner = text[start + 1 + len(cmd) : end].strip()  # 去掉 "(cmd"
     if inner.endswith(")"):
-        inner = inner[:-1].strip()                   # 去掉命令收尾 ")"
+        inner = inner[:-1].strip()  # 去掉命令收尾 ")"
     sense = Sense.MAX if cmd == "maximize" else Sense.MIN
     return sense, inner
 
@@ -307,9 +304,9 @@ def _as_number(e) -> Optional[float]:
 
 
 def _is_arith_var(e) -> bool:
-    return (z3.is_const(e)
-            and e.decl().kind() == z3.Z3_OP_UNINTERPRETED
-            and z3.is_arith(e))
+    return (
+        z3.is_const(e) and e.decl().kind() == z3.Z3_OP_UNINTERPRETED and z3.is_arith(e)
+    )
 
 
 def _linear_terms(expr, var_names: list[str]) -> dict[str, float]:
@@ -321,7 +318,7 @@ def _linear_terms(expr, var_names: list[str]) -> dict[str, float]:
 
     def rec(e, scale: float) -> None:
         if _as_number(e) is not None:
-            return                                   # 纯常数项，跳过
+            return  # 纯常数项，跳过
         k = e.decl().kind() if z3.is_app(e) else None
         if k == z3.Z3_OP_ADD:
             for ch in e.children():
@@ -348,7 +345,7 @@ def _linear_terms(expr, var_names: list[str]) -> dict[str, float]:
                 nm = var_children[0].decl().name()
                 coeffs[nm] = coeffs.get(nm, 0.0) + scale * factor
             else:
-                for ch in var_children:              # 非纯 c*x：尽力递归
+                for ch in var_children:  # 非纯 c*x：尽力递归
                     rec(ch, scale * factor)
             return
         if _is_arith_var(e):
@@ -362,8 +359,13 @@ def _linear_terms(expr, var_names: list[str]) -> dict[str, float]:
     return coeffs
 
 
-def smt2_to_instance(source, *, instance_id: str | None = None,
-                     family: str = "imported", description: str = "") -> OMTInstance:
+def smt2_to_instance(
+    source,
+    *,
+    instance_id: str | None = None,
+    family: str = "imported",
+    description: str = "",
+) -> OMTInstance:
     """把单目标 OMT 的 SMT-LIB2（``instance_to_smt2`` 的产物或等价文件）读回 ``OMTInstance``。
 
     ``source``：已存在的 ``.smt2`` 文件路径，或直接的 SMT-LIB2 文本。硬约束与变量由 z3 解析；
@@ -382,8 +384,14 @@ def smt2_to_instance(source, *, instance_id: str | None = None,
     obj_coeffs = _linear_terms(objective, var_names)
     return OMTInstance(
         instance_id=instance_id or derived_id or "imported",
-        variables=variables, hard=hard, objective=objective, sense=sense,
-        obj_coeffs=obj_coeffs, theory=theory, family=family, description=description,
+        variables=variables,
+        hard=hard,
+        objective=objective,
+        sense=sense,
+        obj_coeffs=obj_coeffs,
+        theory=theory,
+        family=family,
+        description=description,
     )
 
 
@@ -419,12 +427,14 @@ def load_dataset(path, *, split: str | None = None) -> list[OMTInstance]:
         for sp in split_dirs:
             for smt2_path in sorted((root / sp).glob("*.smt2")):
                 labels = label_by_key.get((sp, smt2_path.stem), {})
-                out.append(smt2_to_instance(
-                    smt2_path,
-                    instance_id=labels.get("instance_id") or smt2_path.stem,
-                    family=labels.get("family", "imported"),
-                    description=labels.get("description", ""),
-                ))
+                out.append(
+                    smt2_to_instance(
+                        smt2_path,
+                        instance_id=labels.get("instance_id") or smt2_path.stem,
+                        family=labels.get("family", "imported"),
+                        description=labels.get("description", ""),
+                    )
+                )
         return out
 
     # 无标准划分目录：扫全部 .smt2（跳过仅作缓存的无关路径）
@@ -474,12 +484,12 @@ def manifest_mismatches(dataset_dir) -> list[str]:
     listed_splits = {sp for sp, ents in splits.items() if ents}
 
     for sp in sorted(disk_splits | listed_splits):
-        disk_files = {p.name for p in (root / sp).glob("*.smt2")} if (root / sp).is_dir() else set()
-        listed = {
-            Path(e["smt2"]).name
-            for e in splits.get(sp, [])
-            if e.get("smt2")
-        }
+        disk_files = (
+            {p.name for p in (root / sp).glob("*.smt2")}
+            if (root / sp).is_dir()
+            else set()
+        )
+        listed = {Path(e["smt2"]).name for e in splits.get(sp, []) if e.get("smt2")}
         extra = disk_files - listed
         missing = listed - disk_files
         if extra:
@@ -587,8 +597,7 @@ def rebuild_manifest(
         params["train"] = len(splits["train"])
 
     manifest = {
-        "created_at": old.get("created_at")
-        or datetime.now(timezone.utc).isoformat(),
+        "created_at": old.get("created_at") or datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "generator": old.get("generator", "imported"),
         "params": params,
@@ -788,12 +797,14 @@ def solve_binary(
     value = _parse_get_value(stdout, obj_sexpr) if status == "sat" else None
     if status == "sat" and value is None:
         err_lines = [
-            ln.strip()
-            for ln in stdout.splitlines()
-            if ln.strip().startswith("(error")
+            ln.strip() for ln in stdout.splitlines() if ln.strip().startswith("(error")
         ]
         if err_lines:
-            stderr = "; ".join(err_lines) if not stderr else f"{stderr}; {'; '.join(err_lines)}"
+            stderr = (
+                "; ".join(err_lines)
+                if not stderr
+                else f"{stderr}; {'; '.join(err_lines)}"
+            )
     return {
         "value": value,
         "rlimit": rlimit,

@@ -4,6 +4,7 @@
 (退回 VSIDS)，否则覆盖采样原子。记录 (refocus 图, 未定局部索引, 采样索引) 供 REINFORCE 重算
 log-prob。奖励 = −log1p(rlimit)，per-instance EMA baseline。
 """
+
 from __future__ import annotations
 
 import math
@@ -33,23 +34,16 @@ def _policy_state_cpu(policy: BranchingPolicy) -> dict:
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
 
 
-def decide_rl_reward(res: dict) -> float:
+def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
     """由 ``solve_omt_with_decider`` 返回值计算 REINFORCE 奖励。
-
-    有 ``ref_rlimit``（binary 参考）时用相对代价 ``-log1p(ours) + log1p(ref)``，
-    使优于 binary 的求解得到正优势；否则退化为 ``-log1p(weighted rlimit)``。
-    若同时有 ``ref_value`` 且与本次 ``value`` 不一致，额外施加 match 惩罚。
+    若目标值不一致，说明迭代超过上限，惩罚设置为 -2.0
+    否则根据weighted / ref 归一化给出 [-1, 1] 的奖励
     """
-    ours = float(res.get("weighted rlimit") or res.get("rlimit") or 0)
-    ref_rl = res.get("ref_rlimit")
-    if ref_rl is not None and float(ref_rl) > 0:
-        reward = -math.log1p(ours) + math.log1p(float(ref_rl))
-    else:
-        reward = -math.log1p(ours)
-    ref_val = res.get("ref_value")
-    if ref_val is not None and res.get("value") is not None and res["value"] != ref_val:
-        reward -= 1.0
-    return reward
+    if ref_val is not None and (res.get("value") is None or res["value"] != ref_val):
+        return -2.0
+    assert (ref_rlimit is not None) and ref_rlimit > 0
+    ratio = max(res.get("weighted_rlimit") / ref_rlimit, 2.0)
+    return 1.0 - ratio
 
 
 def effective_rl_workers(
@@ -77,17 +71,23 @@ def _steps_to_cpu(steps) -> list:
 
 
 class SamplingPolicyDecider:
-    def __init__(self, policy: BranchingPolicy, defer_logit, assertions,
-                 refocus_every: int = 50, sample: bool = True,
-                 device: str | torch.device = "cpu"):
+    def __init__(
+        self,
+        policy: BranchingPolicy,
+        defer_logit,
+        assertions,
+        refocus_every: int = 50,
+        sample: bool = True,
+        device: str | torch.device = "cpu",
+    ):
         self.policy = policy
-        self.defer_logit = defer_logit          # torch 标量（trainer 持有的可学参数）
+        self.defer_logit = defer_logit  # torch 标量（trainer 持有的可学参数）
         self.device = device
         self.assertions = list(assertions)
         self.refocus_every = max(1, refocus_every)
         self.sample = sample
         self._graph = None
-        self._scores = None                      # detached bool_branch_scores（CPU 采样）
+        self._scores = None  # detached bool_branch_scores（CPU 采样）
         self._bmap: dict = {}
         self._since = self.refocus_every
         self.steps: list = []
@@ -118,11 +118,15 @@ class SamplingPolicyDecider:
         defer = self.defer_logit.detach().cpu().reshape(1)
         logits = torch.cat([defer, self._scores[locs]])
         probs = torch.softmax(logits, dim=0)
-        idx = int(torch.multinomial(probs, 1).item()) if self.sample else int(torch.argmax(probs).item())
+        idx = (
+            int(torch.multinomial(probs, 1).item())
+            if self.sample
+            else int(torch.argmax(probs).item())
+        )
         self.steps.append((self._graph, locs, idx))
         if idx == 0:
-            return None                          # defer -> VSIDS
-        return keys[idx - 1], True               # 覆盖采样原子（相位取真）
+            return None  # defer -> VSIDS
+        return keys[idx - 1], True  # 覆盖采样原子（相位取真）
 
 
 @dataclass
@@ -199,16 +203,17 @@ def _rl_collect_worker(task: tuple) -> tuple:
         sense,
         decider_factory=factory,
         max_iters=max_iters,
-        ref_value=ref_value,
         ref_rlimit=ref_rlimit,
     )
     steps = holder["d"].steps if "d" in holder else []
-    reward = decide_rl_reward(res)
+    reward = decide_rl_reward(res, ref_value, ref_rlimit)
     return inst_idx, _steps_to_cpu(steps), reward, res
 
 
 class DecideRLTrainer:
-    def __init__(self, policy: BranchingPolicy, config: DecideRLConfig = DecideRLConfig()):
+    def __init__(
+        self, policy: BranchingPolicy, config: DecideRLConfig = DecideRLConfig()
+    ):
         self.policy = policy.to(config.device)
         self.config = config
         self.defer_logit = torch.nn.Parameter(torch.zeros((), device=config.device))
@@ -257,11 +262,10 @@ class DecideRLTrainer:
             sense,
             decider_factory=factory,
             max_iters=self.config.max_iters,
-            ref_value=ref_value,
             ref_rlimit=ref_rlimit,
         )
         steps = holder["d"].steps if "d" in holder else []
-        reward = decide_rl_reward(res)
+        reward = decide_rl_reward(res, ref_value, ref_rlimit)
         return steps, reward, res
 
     def _collect_parallel(
@@ -348,8 +352,9 @@ class DecideRLTrainer:
             holder["d"] = d
             return d
 
-        res = solve_sat_with_decider(list(assertions), list(atoms),
-                                     decider_factory=lambda a: factory(a))
+        res = solve_sat_with_decider(
+            list(assertions), list(atoms), decider_factory=lambda a: factory(a)
+        )
         steps = holder["d"].steps if "d" in holder else []
         reward = -math.log1p(res["conflicts"])
         return steps, reward, res
@@ -365,8 +370,10 @@ class DecideRLTrainer:
                 stats.update({"iter": it, "instance": j, "conflicts": res["conflicts"]})
                 history.append(stats)
                 if log:
-                    print(f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
-                          f"conflicts={res['conflicts']} steps={stats['steps']}")
+                    print(
+                        f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
+                        f"conflicts={res['conflicts']} steps={stats['steps']}"
+                    )
         return history
 
     def update(self, steps, reward, key) -> dict:
@@ -395,8 +402,9 @@ class DecideRLTrainer:
         loss = loss / n
         self.opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(self.policy.parameters()) + [self.defer_logit],
-                                       self.config.grad_clip)
+        torch.nn.utils.clip_grad_norm_(
+            list(self.policy.parameters()) + [self.defer_logit], self.config.grad_clip
+        )
         self.opt.step()
         self._update_baseline_for(key, reward)
         return {"loss": float(loss), "reward": reward, "steps": n}
@@ -472,17 +480,19 @@ class DecideRLTrainer:
                         )
                         for upd_i, (j, steps, reward, res) in enumerate(batch):
                             stats = self.update(steps, reward, key=j)
-                            stats.update({
-                                "iter": it,
-                                "instance": j,
-                                "rlimit": res["rlimit"],
-                                "conflicts": res["conflicts"],
-                                "ref_rlimit": res.get("ref_rlimit"),
-                                "match": (
-                                    res.get("ref_value") is None
-                                    or res.get("value") == res.get("ref_value")
-                                ),
-                            })
+                            stats.update(
+                                {
+                                    "iter": it,
+                                    "instance": j,
+                                    "rlimit": res["rlimit"],
+                                    "conflicts": res["conflicts"],
+                                    "ref_rlimit": res.get("ref_rlimit"),
+                                    "match": (
+                                        res.get("ref_value") is None
+                                        or res.get("value") == res.get("ref_value")
+                                    ),
+                                }
+                            )
                             history.append(stats)
                             if log:
                                 print(
@@ -505,17 +515,19 @@ class DecideRLTrainer:
                                 ref_rlimit=rls[j],
                             )
                             stats = self.update(steps, reward, key=j)
-                            stats.update({
-                                "iter": it,
-                                "instance": j,
-                                "rlimit": res["rlimit"],
-                                "conflicts": res["conflicts"],
-                                "ref_rlimit": res.get("ref_rlimit"),
-                                "match": (
-                                    res.get("ref_value") is None
-                                    or res.get("value") == res.get("ref_value")
-                                ),
-                            })
+                            stats.update(
+                                {
+                                    "iter": it,
+                                    "instance": j,
+                                    "rlimit": res["rlimit"],
+                                    "conflicts": res["conflicts"],
+                                    "ref_rlimit": res.get("ref_rlimit"),
+                                    "match": (
+                                        res.get("ref_value") is None
+                                        or res.get("value") == res.get("ref_value")
+                                    ),
+                                }
+                            )
                             history.append(stats)
                             if log:
                                 print(
@@ -529,9 +541,7 @@ class DecideRLTrainer:
                         and checkpoint_every > 0
                         and (it + 1) % checkpoint_every == 0
                     ):
-                        ckpt = os.path.join(
-                            checkpoint_dir, f"iter_{it + 1:04d}.pt"
-                        )
+                        ckpt = os.path.join(checkpoint_dir, f"iter_{it + 1:04d}.pt")
                         self.save_checkpoint(
                             ckpt,
                             meta={"iter": it + 1, "iterations": iterations},
