@@ -96,7 +96,11 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
-        if sample and rlimit - solver_rlimit > 2 * ref_rlimit:
+        if (
+            sample
+            and ref_rlimit is not None
+            and rlimit - solver_rlimit > 2 * ref_rlimit
+        ):
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)
