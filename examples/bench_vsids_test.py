@@ -7,7 +7,7 @@
 运行::
 
     python -m examples.bench_vsids_test
-    python -m examples.bench_vsids_test --dataset-dir examples/artifacts/decide_branch_dataset
+    python -m examples.bench_vsids_test --dataset-dir examples/artifacts/dataset
     python -m examples.bench_vsids_test --workers 16 --limit 20
     python -m examples.bench_vsids_test --ref-rlimit-from-binary
 """
@@ -36,7 +36,7 @@ from omt_branching.solver.decide_omt import (
 )
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
-DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "dataset")
 DEFAULT_WORKERS = max(1, min(30, (os.cpu_count() or 4)))
 
 

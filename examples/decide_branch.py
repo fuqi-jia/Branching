@@ -1,13 +1,11 @@
 """三臂对比：z3 二进制参考 / VSIDS-decide / learned-decide。
 
-以数据集中缓存的 ``solve_binary`` 结果为参考最优值，测量 VSIDS/learned 相对参考的
-正确性（match）与 rlimit/conflicts/decisions。为 Phase 2（look-ahead imitation + RL）铺路。
+以 ``examples/artifacts/dataset`` 中缓存的 ``solve_binary`` 结果为参考最优值，测量
+VSIDS/learned 相对参考的正确性（match）与 rlimit/conflicts/decisions。
 
-数据集：若 ``--dataset-dir`` 已有 ``manifest.json``，用 ``smt2_to_instance`` /
-``load_dataset`` 读取，不再重新生成；否则按参数生成并落盘。
-
-binary 参考解须事先由 ``python -m examples.solve_dataset_binary`` 写入
-``binary/<split>/<id>.json``；本脚本测试臂直接读缓存。
+数据集须事先由 ``python -m examples.generate_dataset`` 生成；本脚本只检查/重建
+``manifest.json``，不生成实例。binary 参考解须由
+``python -m examples.solve_dataset_binary`` 写入 ``binary/<split>/<id>.json``。
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ import json
 import os
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 
@@ -35,12 +32,10 @@ from omt_branching.solver.rl_decide import (
     effective_rl_workers,
 )
 from omt_branching.solver import (
-    generate_bool_lia_dataset,
     load_dataset,
     list_split_entries,
     manifest_mismatches,
     rebuild_manifest,
-    save_dataset,
     solve_omt_with_decider,
 )
 from omt_branching.solver.binary_results import (
@@ -55,7 +50,7 @@ from omt_branching.solver.policy_decider import PolicyDecider
 from tqdm import tqdm
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
-DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "dataset")
 DEFAULT_CKPT_DIR = os.path.join(ARTIFACTS, "rl_checkpoints")
 DEFAULT_TEST_WORKERS = 30
 
@@ -73,13 +68,6 @@ def _stats_for_json(stats: dict) -> dict:
     return {k: _json_value(v) for k, v in stats.items()}
 
 
-def dataset_exists(dataset_dir: str) -> bool:
-    root = Path(dataset_dir)
-    if (root / "manifest.json").is_file():
-        return True
-    return any((root / sp).glob("*.smt2") for sp in ("test", "train"))
-
-
 def _sync_manifest_if_needed(dataset_dir: str) -> None:
     """若 manifest 与磁盘 .smt2 不一致，按磁盘重建。"""
     issues = manifest_mismatches(dataset_dir)
@@ -90,6 +78,16 @@ def _sync_manifest_if_needed(dataset_dir: str) -> None:
         print(f"  - {msg}")
     rebuild_manifest(dataset_dir, preserve_meta=True)
     print(f"已重建 -> {Path(dataset_dir) / 'manifest.json'}")
+
+
+def _require_dataset(dataset_dir: str) -> None:
+    root = Path(dataset_dir)
+    has_smt2 = any(root.glob("test/*.smt2")) or any(root.glob("train/*.smt2"))
+    if not root.is_dir() or not has_smt2:
+        raise SystemExit(
+            f"未找到数据集: {dataset_dir}\n"
+            f"请先运行: python -m examples.generate_dataset"
+        )
 
 
 def _smt2_abs_paths(dataset_dir: str, entries: list[dict]) -> list[str]:
@@ -191,40 +189,30 @@ def _run_test_parallel(
     return [by_id[e["instance_id"]] for e in entries]
 
 
+def _load_train_split(dataset_dir: str) -> tuple[list[OMTInstance], list[dict]]:
+    train_entries = list_split_entries(dataset_dir, "train")
+    if not train_entries:
+        raise SystemExit(
+            f"需要 train 划分但数据集中没有: {dataset_dir}\n"
+            f"请用 python -m examples.generate_dataset --train N 生成"
+        )
+    train_insts = load_dataset(dataset_dir, split="train")
+    return train_insts, train_entries
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="UserPropagator 学习分支三臂对比（binary 参考）")
-    ap.add_argument("--test", type=int, default=20)
-    ap.add_argument("--min-vars", type=int, default=4)
-    ap.add_argument("--max-vars", type=int, default=5)
+    ap = argparse.ArgumentParser(
+        description="UserPropagator 学习分支三臂对比（使用 artifacts/dataset）"
+    )
     ap.add_argument("--refocus", type=int, default=50)
     ap.add_argument(
-        "--train", type=int, default=0, help="look-ahead imitation 训练集规模(0=不训练)"
+        "--imitation",
+        action="store_true",
+        help="在 train 划分上做 look-ahead imitation",
     )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--rl-iters", type=int, default=0, help="RL 微调轮数(0=不做 RL)")
-    ap.add_argument("--hard", action="store_true", help="用更难实例(headroom)")
-    ap.add_argument(
-        "--dataset-dir",
-        default=DEFAULT_DATASET_DIR,
-        help="数据集落盘目录（manifest + SMT2）；默认 examples/artifacts/decide_branch_dataset",
-    )
-    ap.add_argument(
-        "--force-regen",
-        action="store_true",
-        help="忽略已有数据集，按参数重新生成并覆盖落盘",
-    )
-    ap.add_argument(
-        "--no-save-dataset",
-        action="store_true",
-        help="新生成时不落盘（仅当无已有数据集时有效）",
-    )
     ap.add_argument("--z3-path", default=None, help="z3 可执行文件路径（默认同 PATH）")
-    ap.add_argument(
-        "--binary-timeout",
-        type=int,
-        default=1200,
-        help="（仅提示用）binary 求解请走 solve_dataset_binary --timeout",
-    )
     ap.add_argument(
         "--test-workers",
         type=int,
@@ -255,113 +243,42 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    dataset_dir = DEFAULT_DATASET_DIR
     device = args.device or gnn_device()
     print(f"GNN device: {device}")
+    print(f"数据集目录: {dataset_dir}")
 
     z3_path = args.z3_path or shutil.which("z3")
     if not z3_path:
         raise SystemExit("未找到 z3 二进制，请用 --z3-path 指定")
 
-    from omt_branching.solver import generate_hard_bool_lia_dataset
+    _require_dataset(dataset_dir)
+    _sync_manifest_if_needed(dataset_dir)
 
-    gen = generate_hard_bool_lia_dataset if args.hard else generate_bool_lia_dataset
+    test_entries = list_split_entries(dataset_dir, "test")
+    if not test_entries:
+        raise SystemExit(f"数据集无 test 划分: {dataset_dir}")
+    insts = load_dataset(dataset_dir, split="test")
+    print(f"测试集 {len(insts)} 个实例已从磁盘加载")
+
+    train_insts: list[OMTInstance] = []
+    train_entries: list[dict] = []
+    if args.imitation or args.rl_iters > 0:
+        train_insts, train_entries = _load_train_split(dataset_dir)
+        print(f"训练集 {len(train_insts)} 个实例已从磁盘加载")
 
     torch.manual_seed(0)
-    use_existing = dataset_exists(args.dataset_dir) and not args.force_regen
-    manifest: dict | None = None
-    test_entries: list[dict] = []
-    train_entries: list[dict] = []
-    train_insts: list[OMTInstance] = []
-
-    if use_existing:
-        print(f"使用已有数据集（smt2_to_instance）: {args.dataset_dir}")
-        _sync_manifest_if_needed(args.dataset_dir)
-        with open(Path(args.dataset_dir) / "manifest.json", encoding="utf-8") as f:
-            manifest = json.load(f)
-        test_entries = list_split_entries(args.dataset_dir, "test")
-        if not test_entries:
-            raise SystemExit(f"数据集无 test 划分: {args.dataset_dir}")
-        insts = load_dataset(args.dataset_dir, split="test")
-        print(f"测试集 {len(insts)} 个实例已从磁盘加载")
-        if args.train > 0 or args.rl_iters > 0:
-            train_entries = list_split_entries(args.dataset_dir, "train")
-            if not train_entries:
-                raise SystemExit(
-                    "需要 train 划分但数据集中没有；请用 --force-regen 重新生成，"
-                    "或补全 dataset 的 train/"
-                )
-            train_insts = load_dataset(args.dataset_dir, split="train")
-            print(f"训练集 {len(train_insts)} 个实例已从磁盘加载")
-    else:
-        insts = gen(args.test, seed=99, min_vars=args.min_vars, max_vars=args.max_vars)
-        if args.no_save_dataset:
-            raise SystemExit(
-                "评测/训练 worker 需要落盘 .smt2；请去掉 --no-save-dataset，"
-                "或先准备好 --dataset-dir 中的已有数据集。"
-            )
-        os.makedirs(args.dataset_dir, exist_ok=True)
-        gen_name = "hard_bool_lia" if args.hard else "bool_lia"
-        manifest = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "generator": gen_name,
-            "params": {
-                "test": args.test,
-                "train": args.train,
-                "min_vars": args.min_vars,
-                "max_vars": args.max_vars,
-                "hard": args.hard,
-                "refocus": args.refocus,
-                "epochs": args.epochs,
-                "rl_iters": args.rl_iters,
-            },
-            "seeds": {"test": 99, "train": 1},
-            "splits": {},
-        }
-        test_entries = save_dataset(insts, args.dataset_dir, split="test")
-        manifest["splits"]["test"] = test_entries
-        print(f"测试集 {len(insts)} 个实例已保存 -> {args.dataset_dir}/test/")
-
-        if args.train > 0 or args.rl_iters > 0:
-            n_train = args.train if args.train > 0 else 40
-            train_insts = gen(
-                n_train, seed=1, min_vars=args.min_vars, max_vars=args.max_vars
-            )
-            train_entries = save_dataset(
-                train_insts, args.dataset_dir, split="train"
-            )
-            manifest["splits"]["train"] = train_entries
-            print(
-                f"训练集 {len(train_insts)} 个实例已保存 -> {args.dataset_dir}/train/"
-            )
-
-        # 直接写入完整 manifest（条目来自刚落盘的实例；save_dataset 已 prune 残留）
-        manifest_path = os.path.join(args.dataset_dir, "manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=4, ensure_ascii=False)
-        print(f"数据集清单已保存 -> {manifest_path}")
-        print(
-            "请先生成 binary 缓存后再评测:\n"
-            f"  python -m examples.solve_dataset_binary --dataset-dir {args.dataset_dir}\n"
-            "然后再重新运行本脚本（将自动加载已有数据集）。"
-        )
-        raise SystemExit(0)
-
-    _require_binary_cache(args.dataset_dir, "test", test_entries)
+    _require_binary_cache(dataset_dir, "test", test_entries)
 
     policy = BranchingPolicy()
-    if args.train > 0:
+    if args.imitation:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
         from omt_branching.solver.training_data import (
             build_lookahead_examples_from_smt2_parallel,
         )
 
-        if not train_insts:
-            train_insts = load_dataset(args.dataset_dir, split="train")
-        if not train_entries:
-            train_entries = list_split_entries(args.dataset_dir, "train")
-
         lookahead_workers = args.test_workers
-        paths = _smt2_abs_paths(args.dataset_dir, train_entries)
+        paths = _smt2_abs_paths(dataset_dir, train_entries)
         ids = [e["instance_id"] for e in train_entries]
         print(
             f"look-ahead 标签构建: {len(paths)} 实例(from smt2), "
@@ -373,7 +290,7 @@ def main() -> None:
                 paths,
                 instance_ids=ids,
                 workers=lookahead_workers,
-                dataset_dir=args.dataset_dir,
+                dataset_dir=dataset_dir,
                 split="train",
                 use_cache=True,
             )
@@ -388,27 +305,23 @@ def main() -> None:
         )
 
     if args.rl_iters > 0:
-        if not train_insts:
-            train_insts = load_dataset(args.dataset_dir, split="train")
-        if not train_entries:
-            train_entries = list_split_entries(args.dataset_dir, "train")
-        missing = missing_binary_ids(args.dataset_dir, train_entries, split="train")
+        missing = missing_binary_ids(dataset_dir, train_entries, split="train")
         if missing:
             preview = ", ".join(missing[:5])
             more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
             raise SystemExit(
                 f"RL 需要 train 划分的 binary 缓存（缺 {preview}{more}）。\n"
                 f"请先运行: python -m examples.solve_dataset_binary "
-                f"--dataset-dir {args.dataset_dir} --split train"
+                f"--dataset-dir {dataset_dir} --split train"
             )
         rl_train = train_insts
-        rl_paths = _smt2_abs_paths(args.dataset_dir, train_entries)
+        rl_paths = _smt2_abs_paths(dataset_dir, train_entries)
         rl_ids = [e["instance_id"] for e in train_entries]
         rl_ref_values = [
-            binary_value(args.dataset_dir, iid, split="train") for iid in rl_ids
+            binary_value(dataset_dir, iid, split="train") for iid in rl_ids
         ]
         rl_ref_rlimits = [
-            binary_rlimit(args.dataset_dir, iid, split="train") for iid in rl_ids
+            binary_rlimit(dataset_dir, iid, split="train") for iid in rl_ids
         ]
 
         rl_workers = effective_rl_workers(len(rl_train), args.rl_workers)
@@ -433,9 +346,6 @@ def main() -> None:
             log=False,
             workers=rl_workers,
             collect_seed=1,
-            collect_hard=args.hard,
-            collect_min_vars=args.min_vars,
-            collect_max_vars=args.max_vars,
             smt2_paths=rl_paths,
             instance_ids=rl_ids,
             ref_values=rl_ref_values,
@@ -487,7 +397,7 @@ def main() -> None:
     per_instance: list[dict] = []
     rows = _run_test_parallel(
         test_entries,
-        args.dataset_dir,
+        dataset_dir,
         policy,
         device,
         args.refocus,
@@ -532,7 +442,7 @@ def main() -> None:
     os.makedirs(ARTIFACTS, exist_ok=True)
     results = {
         "reference": "binary_cache",
-        "dataset_dir": args.dataset_dir,
+        "dataset_dir": dataset_dir,
         "summary": agg,
         "n_instances": len(insts),
         "z3_path": z3_path,

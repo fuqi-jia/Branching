@@ -6,7 +6,7 @@ RL ``binary_rlimit`` / ``binary_value`` 复用。
 运行::
 
     python -m examples.solve_dataset_binary
-    python -m examples.solve_dataset_binary --dataset-dir examples/artifacts/decide_branch_dataset
+    python -m examples.solve_dataset_binary --dataset-dir examples/artifacts/dataset
     python -m examples.solve_dataset_binary --workers 16 --timeout 1200 --force
     python -m examples.solve_dataset_binary --split test
 """
@@ -35,7 +35,7 @@ from omt_branching.solver.decide_omt import (
 )
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
-DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "dataset")
 DEFAULT_WORKERS = max(1, min(30, (os.cpu_count() or 4)))
 
 

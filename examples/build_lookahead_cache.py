@@ -6,7 +6,7 @@
 运行::
 
     python -m examples.build_lookahead_cache
-    python -m examples.build_lookahead_cache --dataset-dir examples/artifacts/decide_branch_dataset
+    python -m examples.build_lookahead_cache --dataset-dir examples/artifacts/dataset
     python -m examples.build_lookahead_cache --split train --workers 12 --force
 """
 
@@ -29,7 +29,7 @@ from omt_branching.solver.lookahead_cache import (
 from omt_branching.solver.propagator_snapshot import build_bool_snapshot
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
-DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "dataset")
 DEFAULT_WORKERS = max(1, min(12, (os.cpu_count() or 4)))
 
 
