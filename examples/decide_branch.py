@@ -369,7 +369,11 @@ def main() -> None:
             )
 
     agg = {
-        "binary": {"rlimit": 0.0, "time_ms": 0.0},
+        "binary": {
+            "rlimit": 0.0,
+            "time_ms": 0.0,
+            "conflicts": 0.0,
+        },
         "vsids": {
             "rlimit": 0.0,
             "decider factory rlimit": 0.0,
@@ -408,8 +412,8 @@ def main() -> None:
         ref = row["binary"]
         v = row["vsids"]
         ln = row["learned"]
-        agg["binary"]["rlimit"] += ref.get("rlimit") or 0
-        agg["binary"]["time_ms"] += ref.get("time_ms") or 0.0
+        for key in agg["binary"].keys():
+            agg["binary"][key] += ref.get(key) or 0
         for key in v.keys():
             if key not in agg["vsids"]:
                 continue
