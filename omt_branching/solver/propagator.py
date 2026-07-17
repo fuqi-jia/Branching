@@ -57,7 +57,9 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         if atom is None:
             return
         self.n_decisions += 1
-        self.next_split(atom, 0, 1 if ph else 0)   # phase: 1=真, 0=假（见 spike 验证）
+        # z3 next_split 的 phase 是 Z3_lbool：真=1，假=-1，未定=0（≠ Python bool）
+        z3_phase = z3.Z3_L_TRUE if ph else z3.Z3_L_FALSE
+        self.next_split(atom, 0, z3_phase)
 
 
 __all__ = ["LearnedDecidePropagator"]
