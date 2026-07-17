@@ -17,6 +17,10 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         super().__init__(s)
         self.atoms = list(atoms)
         self.key2atom = {atom_key(a): a for a in self.atoms}
+        # z3 每次回调都新建 t 的 Python 包装（id() 不稳定），但底层 AST 的 get_id() 稳定。
+        # 注册原子被 self.atoms 钉住存活整个求解，其 get_id() 不会被回收复用，故可安全建表：
+        # _on_fixed 里用 get_id() O(1) 命中，避免每次回调对原子做 str()（实测占总耗时 ~65%）。
+        self._id2key = {a.get_id(): k for k, a in self.key2atom.items()}
         self.decider = decider
         self._val: dict = {}          # key -> bool（当前赋值）
         self._trail: list = []
@@ -40,8 +44,9 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         return LearnedDecidePropagator(new_ctx, self.atoms, self.decider)
 
     def _on_fixed(self, t, v):
-        k = atom_key(t)
-        if k not in self._val:
+        # get_id() 命中已注册原子（z3 只对 add 过的项回调 fixed），避免 str(t)。
+        k = self._id2key.get(t.get_id())
+        if k is not None and k not in self._val:
             self._val[k] = z3.is_true(v)
             self._trail.append(k)
 
@@ -49,7 +54,9 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         undecided = [k for k in self.key2atom if k not in self._val]
         if not undecided:
             return
-        choice = self.decider(undecided, dict(self._val))
+        # self._val 只读传给 decider（各 decider 仅在 refocus 时即时读取、不留引用、不改），
+        # 免去每次 decide 一次 dict 拷贝。
+        choice = self.decider(undecided, self._val)
         if choice is None:
             return                    # 退回 VSIDS
         key, ph = choice

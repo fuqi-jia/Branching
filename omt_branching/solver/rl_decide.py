@@ -43,10 +43,12 @@ def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
     """
     if ref_val is not None and (res.get("value") is None or res["value"] != ref_val):
         return -2.0
-    if res.get("weighted_rlimit") is None:
+    # 键名须与 solve_omt_with_decider 的输出一致（"weighted rlimit"，含空格）；
+    # 早前用 "weighted_rlimit" 恒取到 None -> reward 恒 -2.0 -> REINFORCE 无学习信号。
+    weighted = res.get("weighted rlimit")
+    if weighted is None or ref_rlimit is None or ref_rlimit <= 0:
         return -2.0
-    assert (ref_rlimit is not None) and ref_rlimit > 0
-    ratio = min(1.0 * res.get("weighted_rlimit") / ref_rlimit, 2.0)
+    ratio = min(1.0 * weighted / ref_rlimit, 2.0)
     return 1.0 - ratio
 
 
