@@ -38,18 +38,24 @@ def _policy_state_cpu(policy: BranchingPolicy) -> dict:
 
 def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
     """由 ``solve_omt_with_decider`` 返回值计算 REINFORCE 奖励。
-    若目标值不一致或weighted未生成，说明迭代超过上限，惩罚设置为 -2.0
-    否则根据weighted / ref 归一化给出 [-1, 1] 的奖励
+    若目标值不一致或weighted未生成，说明迭代超过上限，惩罚设置为 -1.0
+    否则根据weighted / ref 归一化给出 (-1, 1) 的奖励
     """
     if ref_val is not None and (res.get("value") is None or res["value"] != ref_val):
-        return -2.0
+        return -1.0
     # 键名须与 solve_omt_with_decider 的输出一致（"weighted rlimit"，含空格）；
     # 早前用 "weighted_rlimit" 恒取到 None -> reward 恒 -2.0 -> REINFORCE 无学习信号。
     weighted = res.get("weighted rlimit")
     if weighted is None or ref_rlimit is None or ref_rlimit <= 0:
-        return -2.0
-    ratio = min(1.0 * weighted / ref_rlimit, 2.0)
-    return 1.0 - ratio
+        return -1.0
+    # ratio = min(1.0 * weighted / ref_rlimit, 2.0)
+    # return 1.0 - ratio
+    ratio = 1.0 * weighted / ref_rlimit
+
+    def _smooth(x: float) -> float:
+        return (1 - x * x) / (1 + x * x)
+
+    return _smooth(ratio)
 
 
 def effective_rl_workers(
@@ -204,7 +210,10 @@ class SamplingPolicyDecider:
             if self._window_defer:
                 return None
             # 粘性原子仍未定：直接返回（无采样）
-            if self._window_choice is not None and self._window_choice in undecided_keys:
+            if (
+                self._window_choice is not None
+                and self._window_choice in undecided_keys
+            ):
                 return self._window_choice, self._window_phase
             # 粘性原子已定：按缓存分数贪心覆盖其余未定
             return self._greedy_from_cache(undecided_keys)
