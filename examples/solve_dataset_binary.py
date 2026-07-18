@@ -1,7 +1,7 @@
 """对数据集中每个实例跑 z3 二进制求解，结果即时写入 ``binary/<split>/<id>.json``。
 
 同一 ``.smt2`` 结果确定性，故只在无缓存时求解；可供 ``decide_branch`` 评测臂与
-RL ``binary_rlimit`` / ``binary_value`` 复用。
+RL ``binary_rlimit`` / ``binary_value`` 复用（含 ``train`` / ``test`` / ``eval``）。
 
 运行::
 
@@ -9,6 +9,7 @@ RL ``binary_rlimit`` / ``binary_value`` 复用。
     python -m examples.solve_dataset_binary --dataset-dir examples/artifacts/dataset
     python -m examples.solve_dataset_binary --workers 16 --timeout 1200 --force
     python -m examples.solve_dataset_binary --split test
+    python -m examples.solve_dataset_binary --split eval
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def main() -> None:
     ap.add_argument(
         "--split",
         default=None,
-        help="只处理某一划分（默认全部）",
+        help="只处理某一划分，如 train / test / eval（默认处理全部划分）",
     )
     ap.add_argument("--z3-path", default=None, help="z3 可执行文件路径")
     ap.add_argument(
@@ -139,9 +140,9 @@ def main() -> None:
 
     manifest = _ensure_manifest(args.dataset_dir)
     splits = manifest.get("splits", {})
-    # 若 manifest 刚重建仍空，直接按磁盘列条目
+    # 若 manifest 刚重建仍空，直接按磁盘列条目（含验证集 eval）
     keys = [args.split] if args.split else (
-        list(splits.keys()) or ["test", "train"]
+        list(splits.keys()) or ["test", "train", "eval"]
     )
     tasks: list[tuple] = []
     for sp in keys:

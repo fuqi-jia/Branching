@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -246,6 +246,23 @@ class DecideRLConfig:
     device: str = field(default_factory=gnn_device)
     workers: int = 1
     min_instances_for_parallel: int = MIN_INSTANCES_FOR_RL_PARALLEL
+
+
+@dataclass
+class EarlyStopConfig:
+    """基于验证集指标的早停。
+
+    ``maximize=True`` 时指标越大越好（如 mean_reward）；否则越小越好
+    （如 mean_weighted_rlimit）。相对提升不足 ``tol`` 则计入 patience。
+    """
+
+    patience: int = 3
+    tol: float = 0.02
+    maximize: bool = True
+    metric_key: str = "mean_reward"
+    min_iters: int = 1
+    max_iters: int = 10_000
+    eval_every: int = 1
 
 
 def _make_rl_process_pool(workers: int) -> ProcessPoolExecutor:
@@ -535,6 +552,8 @@ class DecideRLTrainer:
         ref_rlimits: list[int | None] | None = None,
         checkpoint_dir: str | None = None,
         checkpoint_every: int = 1,
+        eval_callback: Callable[[int, "DecideRLTrainer"], dict] | None = None,
+        early_stop: EarlyStopConfig | None = None,
     ):
         """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。
 
@@ -542,6 +561,10 @@ class DecideRLTrainer:
         seed 重建。``ref_values`` / ``ref_rlimits`` 为各实例的 binary 参考（传入
         ``solve_omt_with_decider`` 供 reward）。``checkpoint_dir`` 非空时每隔
         ``checkpoint_every`` 轮保存中间权重。
+
+        ``iterations=-1`` 时训练直到 ``early_stop`` 判定收敛（须提供
+        ``eval_callback`` + ``early_stop``）；``iterations>0`` 时最多跑该轮数，
+        若中途收敛则提前结束。
         """
         instances = list(instances)
         count = len(instances)
@@ -553,6 +576,21 @@ class DecideRLTrainer:
             raise ValueError("ref_values 长度必须等于 instances")
         if ref_rlimits is not None and len(ref_rlimits) != count:
             raise ValueError("ref_rlimits 长度必须等于 instances")
+        if iterations == 0:
+            return []
+        if iterations < -1:
+            raise ValueError("iterations 须为 -1（直到收敛）或正整数")
+        if iterations == -1:
+            if early_stop is None or eval_callback is None:
+                raise ValueError(
+                    "iterations=-1 需要同时提供 early_stop 与 eval_callback"
+                )
+            max_rounds = early_stop.max_iters
+        else:
+            max_rounds = iterations
+            if early_stop is not None and eval_callback is None:
+                raise ValueError("启用 early_stop 时必须提供 eval_callback")
+
         vals = ref_values if ref_values is not None else [None] * count
         rls = ref_rlimits if ref_rlimits is not None else [None] * count
         requested = workers if workers is not None else self.config.workers
@@ -563,14 +601,31 @@ class DecideRLTrainer:
         )
         use_parallel = n_workers > 1
         history = []
+        eval_history: list[dict] = []
         pool: ProcessPoolExecutor | None = None
         if use_parallel:
             pool = _make_rl_process_pool(n_workers)
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
+
+        best_metric: float | None = None
+        best_state: dict | None = None
+        best_defer: float | None = None
+        stall = 0
+        stop_reason: str | None = None
+        finished_iters = 0
+
+        def _improved(curr: float, best: float) -> bool:
+            assert early_stop is not None
+            scale = abs(best) + 1e-8
+            if early_stop.maximize:
+                return (curr - best) / scale > early_stop.tol
+            return (best - curr) / scale > early_stop.tol
+
         try:
-            with tqdm(total=iterations * count, desc="rl_train") as pbar:
-                for it in range(iterations):
+            pbar_total = max_rounds * count if iterations != -1 else None
+            with tqdm(total=pbar_total, desc="rl_train") as pbar:
+                for it in range(max_rounds):
                     if use_parallel:
                         assert pool is not None
                         batch = self._collect_parallel(
@@ -645,19 +700,101 @@ class DecideRLTrainer:
                                     f"conflicts={res['conflicts']} steps={stats['steps']}"
                                 )
                             pbar.update(1)
+                    finished_iters = it + 1
                     if (
                         checkpoint_dir
                         and checkpoint_every > 0
-                        and (it + 1) % checkpoint_every == 0
+                        and finished_iters % checkpoint_every == 0
                     ):
-                        ckpt = os.path.join(checkpoint_dir, f"iter_{it + 1:04d}.pt")
+                        ckpt = os.path.join(
+                            checkpoint_dir, f"iter_{finished_iters:04d}.pt"
+                        )
                         self.save_checkpoint(
                             ckpt,
-                            meta={"iter": it + 1, "iterations": iterations},
+                            meta={
+                                "iter": finished_iters,
+                                "iterations": iterations,
+                            },
                         )
+
+                    if (
+                        early_stop is not None
+                        and eval_callback is not None
+                        and finished_iters % max(1, early_stop.eval_every) == 0
+                    ):
+                        metrics = dict(eval_callback(finished_iters, self))
+                        metrics["iter"] = finished_iters
+                        eval_history.append(metrics)
+                        key = early_stop.metric_key
+                        if key not in metrics:
+                            raise KeyError(
+                                f"eval_callback 未返回 early_stop.metric_key={key!r}"
+                            )
+                        curr = float(metrics[key])
+                        if best_metric is None or _improved(curr, best_metric):
+                            best_metric = curr
+                            best_state = {
+                                k: v.detach().cpu().clone()
+                                for k, v in self.policy.state_dict().items()
+                            }
+                            best_defer = float(self.defer_logit.detach().cpu())
+                            stall = 0
+                            if checkpoint_dir:
+                                self.save_checkpoint(
+                                    os.path.join(checkpoint_dir, "best_eval.pt"),
+                                    meta={
+                                        "iter": finished_iters,
+                                        "best_metric": best_metric,
+                                        "metric_key": key,
+                                        "best": True,
+                                    },
+                                )
+                        else:
+                            stall += 1
+                        tag = (
+                            f"eval[{key}]={curr:.4f} best={best_metric:.4f} "
+                            f"stall={stall}/{early_stop.patience}"
+                        )
+                        pbar.set_postfix_str(tag)
+                        if log:
+                            print(f"[it {finished_iters}] {tag} | {metrics}")
+                        if (
+                            finished_iters >= early_stop.min_iters
+                            and stall >= early_stop.patience
+                        ):
+                            stop_reason = "converged"
+                            break
+                else:
+                    if iterations == -1:
+                        stop_reason = "max_iters"
+                    else:
+                        stop_reason = "completed"
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
+
+        # 启用早停时回滚到验证集最优权重（收敛 / 跑满上限均如此）
+        if best_state is not None and early_stop is not None:
+            self.policy.load_state_dict(best_state)
+            with torch.no_grad():
+                self.defer_logit.copy_(
+                    torch.tensor(best_defer, device=self.defer_logit.device)
+                )
+
+        # 在 history 末尾附一条汇总（便于日志 / JSON）
+        history.append(
+            {
+                "event": "train_end",
+                "stop_reason": stop_reason or "completed",
+                "finished_iters": finished_iters,
+                "best_metric": best_metric,
+                "metric_key": (
+                    early_stop.metric_key if early_stop is not None else None
+                ),
+                "eval_history": eval_history,
+                "defer_logit": float(self.defer_logit.detach().cpu()),
+            }
+        )
         return history
 
 
@@ -669,4 +806,6 @@ __all__ = [
     "SamplingPolicyDecider",
     "DecideRLConfig",
     "DecideRLTrainer",
+    "EarlyStopConfig",
 ]
+

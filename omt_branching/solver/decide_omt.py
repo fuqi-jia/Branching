@@ -454,7 +454,7 @@ def load_dataset(path, *, split: str | None = None) -> list[OMTInstance]:
 
 def _discover_split_dirs(root: Path) -> list[str]:
     """返回含 ``*.smt2`` 的一级子目录名（排除 ``binary``）。"""
-    skip = {"binary"}
+    skip = {"binary", "lookahead", "rl_checkpoints"}
     found: list[str] = []
     if not root.is_dir():
         return found
@@ -602,10 +602,9 @@ def rebuild_manifest(
         splits[sp] = entries
 
     params = dict(old.get("params") or {})
-    if "test" in splits:
-        params["test"] = len(splits["test"])
-    if "train" in splits:
-        params["train"] = len(splits["train"])
+    for sp_name in ("test", "train", "eval"):
+        if sp_name in splits:
+            params[sp_name] = len(splits[sp_name])
 
     manifest = {
         "created_at": old.get("created_at") or datetime.now(timezone.utc).isoformat(),
