@@ -11,11 +11,21 @@ from omt_branching.solver.policy_decider import PolicyDecider
 
 
 def test_vsids_arm_matches_native():
+    """公平 VSIDS：挂 propagator，decide 恒 defer（不 next_split）。"""
     inst = generate_hard_lia_dataset(1, seed=5, min_vars=4, max_vars=4)[0]
     hard, obj, sense = inst.as_tuple()
     r = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
     assert r["value"] == solve_native(hard, obj, sense)["value"]
-    assert r["decisions"] is None       # VSIDS 臂不挂 propagator
+    assert r["decisions"] == 0          # 挂 prop 但从未 next_split
+
+
+def test_check_sat_loop_arm_matches_native():
+    """check-sat-loop：同样预处理，但不挂 propagator。"""
+    inst = generate_hard_lia_dataset(1, seed=5, min_vars=4, max_vars=4)[0]
+    hard, obj, sense = inst.as_tuple()
+    r = solve_omt_with_decider(hard, obj, sense, attach_propagator=False)
+    assert r["value"] == solve_native(hard, obj, sense)["value"]
+    assert r["decisions"] is None       # 不挂 propagator
 
 
 def test_solve_omt_isolated_context_per_call():

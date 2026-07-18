@@ -2,7 +2,8 @@
 LearnedDecidePropagator 接管内部布尔决策。z3.Optimize 不支持 propagator，故必须走此回路。
 
 对比臂：``solve_native``（Python Optimize API）、``solve_binary``（z3 二进制 ``-st``）、
-``solve_omt_with_decider``（VSIDS / learned UserPropagator 回路）。
+``solve_omt_with_decider``（公平 VSIDS / learned UserPropagator 回路；
+``attach_propagator=False`` 为 check-sat-loop 基线）。
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ def _num(ref):
     return Fraction(str(ref))
 
 
+def _defer_always(_undecided, _assignment):
+    """公平 VSIDS：decide 回调恒返回 None，不调用 next_split，退回 z3 原生 VSIDS。"""
+    return None
+
+
 def solve_omt_with_decider(
     hard,
     objective,
@@ -51,14 +57,21 @@ def solve_omt_with_decider(
     *,
     ref_rlimit: int | None = None,
     sample: bool = False,
+    attach_propagator: bool = True,
 ) -> dict:
     """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
 
-    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按 -2.0
-    处理）；未给定时不做该剪枝。
-    若给定 ``decider_factory``：先对硬约束做轻量预处理，再只向 propagator 注册
-    **析取子句**（字面量数 ≥ 2）中的原子，并在简化后的断言上 ``check``。
-    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回；未给定则不剪枝。
+    始终对硬约束做轻量预处理（``prepare_propagator_formula``），并在简化后的断言上
+    ``check``。
+
+    - ``attach_propagator=True``（默认）：挂 ``LearnedDecidePropagator``，只注册析取子句
+      （字面量数 ≥ 2）中的原子。``decider_factory=None`` 时 decider 恒 defer（公平
+      VSIDS 臂）；否则 ``decider_factory(assertions) -> decider``（learned 臂）。
+    - ``attach_propagator=False``：不挂 propagator（check-sat-loop 臂）；忽略
+      ``decider_factory``。
+
+    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按
+    -2.0 处理）；未给定时不做该剪枝。
     """
     if ctx is None:
         ctx = z3.Context()
@@ -69,11 +82,13 @@ def solve_omt_with_decider(
     solver_rlimit = _stat(s, "rlimit count")
     rlimit = solver_rlimit
     prop = None
-    # 有 decider 时：先无 prop 预处理，再只注册析取子句原子，并对简化后公式求解。
-    hard_use = hard_iso
-    if decider_factory is not None:
-        hard_use, atoms = prepare_propagator_formula(hard_iso)
-        decider = decider_factory(hard_use)
+    # 两臂均预处理；公平 VSIDS / learned 再挂 prop（仅注册析取子句原子）。
+    hard_use, atoms = prepare_propagator_formula(hard_iso)
+    if attach_propagator:
+        if decider_factory is None:
+            decider = _defer_always
+        else:
+            decider = decider_factory(hard_use)
         prop = LearnedDecidePropagator(s, atoms, decider)
     decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
     rlimit += decider_factory_rlimit

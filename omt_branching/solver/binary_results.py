@@ -7,9 +7,11 @@
 缓存约定：
 
 - ``value``：始终来自 z3 **binary** 最优目标值；
-- ``rlimit``：RL / 剪枝用的参考资源——当 VSIDS 目标值与 binary 一致时取 VSIDS
-  的 ``rlimit``（否则回退 binary 的 ``rlimit``）；
-- ``binary`` / ``vsids``：两侧完整（或关键）统计，供三臂对比展示。
+- ``rlimit``：RL / 剪枝用的参考资源——当公平 VSIDS 目标值与 binary 一致时取
+  VSIDS 的 ``rlimit``（否则回退 binary 的 ``rlimit``）；
+- ``binary``：z3 二进制统计；
+- ``vsids``：公平 VSIDS（预处理 + 挂 propagator、decide 恒 defer）；
+- ``check_sat_loop``：原无 propagator 的 Solver 线性搜索臂（同样预处理）。
 
 并行求解时每实例独立文件，完成后立即写入，无共享锁。
 """
@@ -25,6 +27,8 @@ from typing import Any, Optional
 REF_SUBDIR = "ref"
 # 旧名兼容（曾用 binary/）
 BINARY_SUBDIR = REF_SUBDIR
+
+_NESTED_ARMS = ("binary", "vsids", "check_sat_loop")
 
 
 def ref_result_path(
@@ -67,7 +71,7 @@ def serialize_binary_result(result: dict) -> dict:
     """把求解结果 dict 转为 JSON 可序列化形式（保留全字段）。"""
     out: dict = {}
     for k, v in result.items():
-        if k in ("binary", "vsids") and isinstance(v, dict):
+        if k in _NESTED_ARMS and isinstance(v, dict):
             out[k] = serialize_binary_result(v)
         elif k == "z3_stats" and isinstance(v, dict):
             out[k] = {sk: _json_default(sv) for sk, sv in v.items()}
@@ -88,11 +92,11 @@ def _parse_value(raw) -> Any:
 
 
 def deserialize_binary_result(payload: dict) -> dict:
-    """读回落盘结果：把 ``value``（及嵌套 binary/vsids.value）尽量还原为 ``Fraction``。"""
+    """读回落盘结果：把 ``value``（及嵌套臂的 value）尽量还原为 ``Fraction``。"""
     out = dict(payload)
     if "value" in out:
         out["value"] = _parse_value(out["value"])
-    for nest in ("binary", "vsids"):
+    for nest in _NESTED_ARMS:
         nested = out.get(nest)
         if isinstance(nested, dict) and "value" in nested:
             nested = dict(nested)
@@ -101,14 +105,36 @@ def deserialize_binary_result(payload: dict) -> dict:
     return out
 
 
-def build_ref_payload(binary_result: dict, vsids_result: dict | None = None) -> dict:
-    """由 binary / VSIDS 结果构造缓存 payload。
+def is_fair_vsids_cache(ref: dict | None) -> bool:
+    """判断 ref 是否含公平 VSIDS + check-sat-loop 缓存。
+
+    公平 VSIDS 挂 prop 后 ``decisions`` 为 int（通常 0）；旧缓存无 prop 时为
+    ``None``。同时要求 ``check_sat_loop`` 非空。
+    """
+    if not isinstance(ref, dict):
+        return False
+    vsids = ref.get("vsids")
+    csl = ref.get("check_sat_loop")
+    if not isinstance(vsids, dict) or not vsids:
+        return False
+    if not isinstance(csl, dict) or not csl:
+        return False
+    return vsids.get("decisions") is not None
+
+
+def build_ref_payload(
+    binary_result: dict,
+    vsids_result: dict | None = None,
+    check_sat_loop_result: dict | None = None,
+) -> dict:
+    """由 binary / 公平 VSIDS / check-sat-loop 结果构造缓存 payload。
 
     - ``value`` ← binary
-    - ``rlimit`` ← VSIDS 的 ``rlimit``（目标值与 binary 一致时）否则 binary
+    - ``rlimit`` ← 公平 VSIDS 的 ``rlimit``（目标值与 binary 一致时）否则 binary
     """
     bin_val = binary_result.get("value")
     vsids = vsids_result or {}
+    csl = check_sat_loop_result or {}
     vsids_val = vsids.get("value")
     match = (
         bin_val is not None
@@ -129,14 +155,32 @@ def build_ref_payload(binary_result: dict, vsids_result: dict | None = None) -> 
         "vsids_match": bool(match),
         "binary_rlimit": binary_result.get("rlimit"),
         "vsids_rlimit": vsids.get("rlimit"),
+        "check_sat_loop_rlimit": csl.get("rlimit"),
         "status": binary_result.get("status"),
         "time_ms": binary_result.get("time_ms"),
         "conflicts": binary_result.get("conflicts"),
         "decisions": binary_result.get("decisions"),
         "binary": dict(binary_result),
         "vsids": dict(vsids) if vsids else {},
+        "check_sat_loop": dict(csl) if csl else {},
     }
     return payload
+
+
+def vsids_stats_from_ref(ref: dict) -> dict:
+    """取出缓存中的公平 VSIDS 统计。"""
+    nested = ref.get("vsids")
+    if isinstance(nested, dict) and nested:
+        return nested
+    return {}
+
+
+def check_sat_loop_stats_from_ref(ref: dict) -> dict:
+    """取出缓存中的 check-sat-loop 统计。"""
+    nested = ref.get("check_sat_loop")
+    if isinstance(nested, dict) and nested:
+        return nested
+    return {}
 
 
 def save_binary_result(
@@ -189,7 +233,7 @@ def binary_rlimit(
     *,
     split: str,
 ) -> Optional[int]:
-    """RL reward 用：返回缓存的参考 ``rlimit``（VSIDS 优先，见模块文档）。"""
+    """RL reward 用：返回缓存的参考 ``rlimit``（公平 VSIDS 优先，见模块文档）。"""
     res = load_binary_result(dataset_dir, instance_id, split=split)
     if res is None:
         return None
@@ -262,10 +306,13 @@ __all__ = [
     "has_binary_result",
     "serialize_binary_result",
     "deserialize_binary_result",
+    "is_fair_vsids_cache",
     "build_ref_payload",
     "save_binary_result",
     "load_binary_result",
     "binary_stats_from_ref",
+    "vsids_stats_from_ref",
+    "check_sat_loop_stats_from_ref",
     "binary_rlimit",
     "binary_value",
     "load_binary_results",

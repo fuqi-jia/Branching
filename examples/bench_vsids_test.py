@@ -1,8 +1,8 @@
-"""在测试集上批量跑 ``solve_omt_with_decider(..., decider_factory=None)``。
+"""在测试集上批量跑公平 VSIDS 臂（``decider_factory=None``）。
 
-``factory=None`` 时**不挂** UserPropagator，走 Solver 线性搜索 + z3 原生 VSIDS
-（有预处理），用于测量「始终 defer / 无学习回调」时的回路效率，并可选对照
-``binary/`` 缓存。
+``factory=None`` 时挂 UserPropagator，decide 恒 defer（不 ``next_split``），
+与 learned 同预处理口径，用于测量「始终 defer / 无学习回调」时的回路效率，
+并可选对照 ``ref/`` 缓存。
 
 运行::
 
@@ -115,7 +115,7 @@ def _vsids_worker(task: tuple) -> dict:
         "value": _json_value(res.get("value")),
         "rlimit": res.get("rlimit"),
         "conflicts": res.get("conflicts"),
-        "decisions": res.get("decisions"),  # factory=None 时为 None
+        "decisions": res.get("decisions"),  # 公平 VSIDS 恒 defer → 通常为 0
         "iters": res.get("iters"),
         "ref_rlimit": ref_rlimit,
         "ref_value": _json_value(ref_value),
@@ -231,14 +231,11 @@ def main() -> None:
     ]
     n_workers = max(1, min(args.workers, len(tasks)))
     print(
-        f"VSIDS bench (factory=None): split={args.split}, "
-        f"n={len(tasks)}, workers={n_workers}, "
+        f"公平 VSIDS bench (factory=None, attach_propagator=True): "
+        f"split={args.split}, n={len(tasks)}, workers={n_workers}, "
         f"ref_rlimit_from_binary={args.ref_rlimit_from_binary}"
     )
-    print(
-        "说明: 不挂 UserPropagator；与「挂 prop 且始终 defer」不同"
-        "（后者仍关预处理）。"
-    )
+    print("说明: 预处理 + 挂 propagator，decide 恒 defer（与 learned 同口径）。")
 
     rows: list[dict] = []
     t0 = time.perf_counter()
@@ -256,8 +253,10 @@ def main() -> None:
     summary["split"] = args.split
     summary["dataset_dir"] = str(root.resolve())
     summary["decider_factory"] = None
+    summary["attach_propagator"] = True
     summary["note"] = (
-        "solve_omt_with_decider(decider_factory=None)：无 propagator，原生 VSIDS"
+        "solve_omt_with_decider(decider_factory=None)：公平 VSIDS"
+        "（挂 prop、恒 defer）"
     )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

@@ -1,4 +1,4 @@
-"""加载已有策略权重，在数据集 test 划分上做三臂对比并写 ``results.json``。
+"""加载已有策略权重，在数据集 test 划分上做四臂对比并写 ``results.json``。
 
 评测逻辑与 ``examples/decide_branch.py`` 一致（``PolicyDecider`` + ref 缓存参考），
 不训练。默认权重 ``examples/artifacts/rl_decide_policy.pt``，默认数据
@@ -41,7 +41,7 @@ DEFAULT_OUT = os.path.join(ARTIFACTS, "results.json")
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="加载 checkpoint，在 dataset test 上三臂对比并写 results.json"
+        description="加载 checkpoint，在 dataset test 上四臂对比并写 results.json"
     )
     ap.add_argument(
         "--checkpoint",
@@ -107,35 +107,27 @@ def main() -> None:
         extra = f", defer_logit={defer}" if defer is not None else ""
         print(f"已加载权重 meta keys={list(meta.keys())}{extra}")
 
+    _solver_arm = {
+        "rlimit": 0.0,
+        "decider factory rlimit": 0.0,
+        "model base rlimit": 0.0,
+        "model cut rlimit": 0.0,
+        "check rlimit": 0.0,
+        "eval rlimit": 0.0,
+        "weighted rlimit": 0.0,
+        "conflicts": 0.0,
+        "decisions": 0.0,
+        "match": 0.0,
+    }
     agg = {
         "binary": {
             "rlimit": 0.0,
             "time_ms": 0.0,
             "conflicts": 0.0,
         },
-        "vsids": {
-            "rlimit": 0.0,
-            "decider factory rlimit": 0.0,
-            "model base rlimit": 0.0,
-            "model cut rlimit": 0.0,
-            "check rlimit": 0.0,
-            "eval rlimit": 0.0,
-            "weighted rlimit": 0.0,
-            "conflicts": 0.0,
-            "match": 0.0,
-        },
-        "learned": {
-            "rlimit": 0.0,
-            "decider factory rlimit": 0.0,
-            "model base rlimit": 0.0,
-            "model cut rlimit": 0.0,
-            "check rlimit": 0.0,
-            "eval rlimit": 0.0,
-            "weighted rlimit": 0.0,
-            "conflicts": 0.0,
-            "decisions": 0.0,
-            "match": 0.0,
-        },
+        "check_sat_loop": dict(_solver_arm),
+        "vsids": dict(_solver_arm),
+        "learned": dict(_solver_arm),
     }
     per_instance: list[dict] = []
     rows = _run_test_parallel(
@@ -149,40 +141,44 @@ def main() -> None:
     for row in rows:
         ref_val = row["ref_val"]
         ref = row["binary"]
+        csl = row.get("check_sat_loop") or {}
         v = row["vsids"]
         ln = row["learned"]
         for key in agg["binary"].keys():
             agg["binary"][key] += ref.get(key) or 0
-        for key in v.keys():
-            if key not in agg["vsids"]:
-                continue
-            agg["vsids"][key] += v[key]
-        agg["vsids"]["match"] += 1.0 if v["value"] == ref_val else 0.0
-        for key in ln.keys():
-            if key not in agg["learned"]:
-                continue
-            agg["learned"][key] += ln[key]
-        agg["learned"]["match"] += 1.0 if ln["value"] == ref_val else 0.0
+        for arm_key, arm_stats in (
+            ("check_sat_loop", csl),
+            ("vsids", v),
+            ("learned", ln),
+        ):
+            for key in arm_stats.keys():
+                if key not in agg[arm_key]:
+                    continue
+                val = arm_stats[key]
+                agg[arm_key][key] += 0 if val is None else val
+            agg[arm_key]["match"] += (
+                1.0 if arm_stats.get("value") == ref_val else 0.0
+            )
         per_instance.append({
             "instance_id": row["instance_id"],
             "binary": _stats_for_json(ref),
+            "check_sat_loop": _stats_for_json(csl),
             "vsids": _stats_for_json(v),
             "learned": _stats_for_json(ln),
         })
 
     n = max(1, len(insts))
     print(
-        f"=== 三臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
+        f"=== 四臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
         f"match=1 为与该最优值一致）==="
     )
-    for key in agg["binary"].keys():
-        agg["binary"][key] /= n
-    for key in agg["vsids"].keys():
-        agg["vsids"][key] /= n
-    for key in agg["learned"].keys():
-        agg["learned"][key] /= n
+    for arm in agg:
+        for key in agg[arm]:
+            agg[arm][key] /= n
 
     print(f"summary.binary  = { {k: round(v, 4) if isinstance(v, float) else v for k, v in agg['binary'].items()} }")
+    print(f"summary.check_sat_loop match={agg['check_sat_loop']['match']:.3f}  "
+          f"weighted_rlimit={agg['check_sat_loop'].get('weighted rlimit', 0):.1f}")
     print(f"summary.vsids   match={agg['vsids']['match']:.3f}  "
           f"weighted_rlimit={agg['vsids'].get('weighted rlimit', 0):.1f}")
     print(f"summary.learned match={agg['learned']['match']:.3f}  "

@@ -3,8 +3,10 @@
 对每个实例：
 
 1. 跑 z3 **binary**（``solve_binary``）得到最优 ``value``；
-2. 跑 **VSIDS-decide**（``solve_omt_with_decider``，无 decider）得到同口径资源；
-3. 落盘到 ``ref/``：``value`` 始终取 binary；若 VSIDS 目标值与 binary 一致，
+2. 跑 **公平 VSIDS**（``solve_omt_with_decider``，预处理 + 挂 propagator、decide 恒
+   defer）得到同口径资源；
+3. 跑 **check-sat-loop**（同样预处理，但不挂 propagator）作为原 VSIDS 基线；
+4. 落盘到 ``ref/``：``value`` 始终取 binary；若公平 VSIDS 目标值与 binary 一致，
    则缓存 ``rlimit`` 取 VSIDS 的 ``rlimit``，否则回退 binary ``rlimit``。
 
 可供 ``decide_branch`` 评测臂与 RL ``binary_rlimit`` / ``binary_value`` 复用
@@ -33,7 +35,8 @@ from tqdm import tqdm
 from omt_branching.solver.binary_results import (
     REF_SUBDIR,
     build_ref_payload,
-    has_ref_result,
+    is_fair_vsids_cache,
+    load_binary_result,
     save_binary_result,
 )
 from omt_branching.solver.decide_omt import (
@@ -65,7 +68,7 @@ def _ensure_manifest(dataset_dir: str) -> dict:
 
 
 def _solve_worker(task: tuple) -> dict:
-    """ProcessPool worker：binary + VSIDS，立刻写入 ref/。"""
+    """ProcessPool worker：binary + 公平 VSIDS + check-sat-loop，立刻写入 ref/。"""
     (
         dataset_dir,
         split,
@@ -75,13 +78,15 @@ def _solve_worker(task: tuple) -> dict:
         timeout_s,
         force,
     ) = task
-    if not force and has_ref_result(dataset_dir, instance_id, split=split):
-        return {
-            "instance_id": instance_id,
-            "split": split,
-            "skipped": True,
-            "status": "cached",
-        }
+    if not force:
+        cached = load_binary_result(dataset_dir, instance_id, split=split)
+        if cached is not None and is_fair_vsids_cache(cached):
+            return {
+                "instance_id": instance_id,
+                "split": split,
+                "skipped": True,
+                "status": "cached",
+            }
 
     smt2_path = Path(dataset_dir) / smt2_relpath
     if not smt2_path.is_file():
@@ -101,19 +106,32 @@ def _solve_worker(task: tuple) -> dict:
         inst, z3_path=z3_path, timeout_s=timeout_s, smt2=smt2_text
     )
     vsids_res: dict = {}
+    csl_res: dict = {}
     if bin_res.get("status") in ("sat", "unsat") and bin_res.get("value") is not None:
+        ref_rl = bin_res.get("rlimit")
         try:
             vsids_res = solve_omt_with_decider(
                 hard,
                 obj,
                 sense,
                 decider_factory=None,
-                ref_rlimit=bin_res.get("rlimit"),
+                attach_propagator=True,
+                ref_rlimit=ref_rl,
             )
         except Exception as exc:  # noqa: BLE001 — worker 内记失败，不拖垮整批
             vsids_res = {"value": None, "error": str(exc)}
+        try:
+            csl_res = solve_omt_with_decider(
+                hard,
+                obj,
+                sense,
+                attach_propagator=False,
+                ref_rlimit=ref_rl,
+            )
+        except Exception as exc:  # noqa: BLE001
+            csl_res = {"value": None, "error": str(exc)}
 
-    payload = build_ref_payload(bin_res, vsids_res)
+    payload = build_ref_payload(bin_res, vsids_res, csl_res)
     save_binary_result(dataset_dir, instance_id, payload, split=split)
     return {
         "instance_id": instance_id,
@@ -130,7 +148,10 @@ def _solve_worker(task: tuple) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="并行构造数据集 ref 参考缓存（binary 目标值 + 条件 VSIDS rlimit）"
+        description=(
+            "并行构造数据集 ref 参考缓存"
+            "（binary 目标值 + 公平 VSIDS / check-sat-loop rlimit）"
+        )
     )
     ap.add_argument(
         "--dataset-dir",
@@ -197,7 +218,10 @@ def main() -> None:
         f"timeout={args.timeout}s, force={args.force}"
     )
     print(f"结果目录: {Path(args.dataset_dir) / REF_SUBDIR}/")
-    print("规则: value←binary; rlimit←vsids(若目标值一致) 否则←binary")
+    print(
+        "规则: value←binary; rlimit←公平 vsids(若目标值一致) 否则←binary；"
+        "另缓存 check_sat_loop（预处理、无 propagator）"
+    )
 
     stats = {
         "cached": 0,

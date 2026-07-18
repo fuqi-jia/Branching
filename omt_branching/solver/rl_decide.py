@@ -559,7 +559,7 @@ class DecideRLTrainer:
 
         ``smt2_paths`` 非空时 worker 从落盘文件读实例（与已有 dataset 对齐），否则按
         seed 重建。``ref_values`` / ``ref_rlimits`` 为各实例的 ``ref/`` 缓存参考
-        （``value``←binary；``rlimit`` 在 VSIDS 命中最优时←VSIDS，否则←binary；
+        （``value``←binary；``rlimit`` 在公平 VSIDS 命中最优时←VSIDS，否则←binary；
         传入 ``solve_omt_with_decider`` 供 reward）。``checkpoint_dir`` 非空时每隔
         ``checkpoint_every`` 轮保存中间权重。
 

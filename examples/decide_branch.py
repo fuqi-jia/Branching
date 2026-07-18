@@ -1,8 +1,11 @@
-"""三臂对比：z3 二进制参考 / VSIDS-decide / learned-decide。
+"""四臂对比：z3 二进制 / check-sat-loop / 公平 VSIDS-decide / learned-decide。
 
 以 ``examples/artifacts/dataset`` 中 ``ref/`` 缓存为参考：最优 ``value`` 来自 binary；
-RL 用 ``rlimit`` 在 VSIDS 命中同一最优时取 VSIDS，否则取 binary。测量
-VSIDS/learned 相对参考的正确性（match）与 rlimit/conflicts/decisions。
+RL 用 ``rlimit`` 在公平 VSIDS 命中同一最优时取 VSIDS，否则取 binary。测量
+check-sat-loop / VSIDS / learned 相对参考的正确性（match）与 rlimit/conflicts/decisions。
+
+- **公平 VSIDS**：预处理 + 挂 propagator，decide 恒 defer（不 ``next_split``）；
+- **check-sat-loop**：同样预处理，但不挂 propagator（原 VSIDS 臂）。
 
 数据集须事先由 ``python -m examples.generate_dataset`` 生成；本脚本只检查/重建
 ``manifest.json``，不生成实例。参考缓存须由
@@ -51,8 +54,11 @@ from omt_branching.solver.binary_results import (
     binary_rlimit,
     binary_stats_from_ref,
     binary_value,
+    check_sat_loop_stats_from_ref,
+    is_fair_vsids_cache,
     load_binary_result,
     missing_binary_ids,
+    vsids_stats_from_ref,
 )
 from omt_branching.solver.instance_gen import OMTInstance
 from omt_branching.solver.policy_decider import PolicyDecider
@@ -119,10 +125,25 @@ def _require_binary_cache(dataset_dir: str, split: str, entries: list[dict]) -> 
             f"请先运行: python -m examples.solve_dataset_binary "
             f"--dataset-dir {dataset_dir}"
         )
+    stale = [
+        e["instance_id"]
+        for e in entries
+        if not is_fair_vsids_cache(
+            load_binary_result(dataset_dir, e["instance_id"], split=split)
+        )
+    ]
+    if stale:
+        preview = ", ".join(stale[:5])
+        more = f" 等共 {len(stale)} 个" if len(stale) > 5 else ""
+        raise SystemExit(
+            f"划分 {split} 的 ref 缓存缺少公平 VSIDS（如 {preview}{more}）。\n"
+            f"请重新运行: python -m examples.solve_dataset_binary "
+            f"--dataset-dir {dataset_dir} --force"
+        )
 
 
 def _eval_test_worker(task: tuple) -> dict:
-    """ProcessPool worker：从 .smt2 加载实例，ref 缓存取最优值，跑 VSIDS/learned。"""
+    """ProcessPool worker：ref 缓存取 binary/VSIDS/check-sat-loop，现场只跑 learned。"""
     (
         smt2_path,
         instance_id,
@@ -137,7 +158,8 @@ def _eval_test_worker(task: tuple) -> dict:
     hard, obj, sense = inst.as_tuple()
     ref_val = ref_cache.get("value")
     bin_stats = binary_stats_from_ref(ref_cache)
-    v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
+    v = vsids_stats_from_ref(ref_cache)
+    csl = check_sat_loop_stats_from_ref(ref_cache)
     policy = BranchingPolicy()
     policy.load_state_dict(policy_state)
     policy.to(device)
@@ -156,6 +178,7 @@ def _eval_test_worker(task: tuple) -> dict:
         "instance_id": inst.instance_id,
         "ref_val": ref_val,
         "binary": bin_stats,
+        "check_sat_loop": csl,
         "vsids": v,
         "learned": ln,
     }
@@ -509,7 +532,7 @@ def main() -> None:
         print(
             f"RL collect: {len(rl_train)} 实例 × {iters_desc}, {mode} "
             f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}；"
-            f"reward 使用 ref/ 缓存（value←binary；rlimit←vsids 若命中最优）"
+            f"reward 使用 ref/ 缓存（value←binary；rlimit←公平 vsids 若命中最优）"
         )
         print(f"RL checkpoints -> {args.ckpt_dir}/ (every {args.ckpt_every})")
 
@@ -601,35 +624,27 @@ def main() -> None:
                 f"steps={last_step.get('steps')}"
             )
 
+    _solver_arm = {
+        "rlimit": 0.0,
+        "decider factory rlimit": 0.0,
+        "model base rlimit": 0.0,
+        "model cut rlimit": 0.0,
+        "check rlimit": 0.0,
+        "eval rlimit": 0.0,
+        "weighted rlimit": 0.0,
+        "conflicts": 0.0,
+        "decisions": 0.0,
+        "match": 0.0,
+    }
     agg = {
         "binary": {
             "rlimit": 0.0,
             "time_ms": 0.0,
             "conflicts": 0.0,
         },
-        "vsids": {
-            "rlimit": 0.0,
-            "decider factory rlimit": 0.0,
-            "model base rlimit": 0.0,
-            "model cut rlimit": 0.0,
-            "check rlimit": 0.0,
-            "eval rlimit": 0.0,
-            "weighted rlimit": 0.0,
-            "conflicts": 0.0,
-            "match": 0.0,
-        },
-        "learned": {
-            "rlimit": 0.0,
-            "decider factory rlimit": 0.0,
-            "model base rlimit": 0.0,
-            "model cut rlimit": 0.0,
-            "check rlimit": 0.0,
-            "eval rlimit": 0.0,
-            "weighted rlimit": 0.0,
-            "conflicts": 0.0,
-            "decisions": 0.0,
-            "match": 0.0,
-        },
+        "check_sat_loop": dict(_solver_arm),
+        "vsids": dict(_solver_arm),
+        "learned": dict(_solver_arm),
     }
     per_instance: list[dict] = []
     rows = _run_test_parallel(
@@ -643,38 +658,40 @@ def main() -> None:
     for row in rows:
         ref_val = row["ref_val"]
         ref = row["binary"]
+        csl = row.get("check_sat_loop") or {}
         v = row["vsids"]
         ln = row["learned"]
         for key in agg["binary"].keys():
             agg["binary"][key] += ref.get(key) or 0
-        for key in v.keys():
-            if key not in agg["vsids"]:
-                continue
-            agg["vsids"][key] += v[key]
-        agg["vsids"]["match"] += 1.0 if v["value"] == ref_val else 0.0
-        for key in ln.keys():
-            if key not in agg["learned"]:
-                continue
-            agg["learned"][key] += ln[key]
-        agg["learned"]["match"] += 1.0 if ln["value"] == ref_val else 0.0
+        for arm_key, arm_stats in (
+            ("check_sat_loop", csl),
+            ("vsids", v),
+            ("learned", ln),
+        ):
+            for key in arm_stats.keys():
+                if key not in agg[arm_key]:
+                    continue
+                val = arm_stats[key]
+                agg[arm_key][key] += 0 if val is None else val
+            agg[arm_key]["match"] += (
+                1.0 if arm_stats.get("value") == ref_val else 0.0
+            )
         per_instance.append({
             "instance_id": row["instance_id"],
             "binary": _stats_for_json(ref),
+            "check_sat_loop": _stats_for_json(csl),
             "vsids": _stats_for_json(v),
             "learned": _stats_for_json(ln),
         })
 
     n = max(1, len(insts))
     print(
-        f"=== 三臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
+        f"=== 四臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
         f"match=1 为与该最优值一致）==="
     )
-    for key in agg["binary"].keys():
-        agg["binary"][key] /= n
-    for key in agg["vsids"].keys():
-        agg["vsids"][key] /= n
-    for key in agg["learned"].keys():
-        agg["learned"][key] /= n
+    for arm in agg:
+        for key in agg[arm]:
+            agg[arm][key] /= n
 
     os.makedirs(ARTIFACTS, exist_ok=True)
     results = {
