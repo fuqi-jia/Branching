@@ -37,3 +37,19 @@ def test_refocus_cadence():
     for _ in range(7):
         dec([atom_key(x >= 5)], {})
     assert calls["n"] == 3     # refocus 于第 1,4,7 次调用
+
+
+def test_add_hard_appends_and_forces_refocus():
+    x = z3.Int("x")
+    asserts = [x >= 0, x <= 10, z3.Or(x >= 5, x <= 2)]
+    svc = BranchingPolicyService(policy=BranchingPolicy())
+    dec = PolicyDecider(svc, asserts, refocus_every=100)
+    n0 = len(dec.assertions)
+    cut = x > 3
+    dec([atom_key(x >= 5)], {})   # 消耗首次 refocus
+    assert dec._since == 1
+    dec.add_hard(cut)
+    assert len(dec.assertions) == n0 + 1
+    assert dec.assertions[-1] is cut
+    assert dec._since == dec.refocus_every
+    assert dec._pri is None

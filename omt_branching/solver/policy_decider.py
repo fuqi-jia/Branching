@@ -28,6 +28,14 @@ class PolicyDecider:
         self._phase: dict = {}
         self._since = self.refocus_every   # 首次即 refocus
 
+    def add_hard(self, *exprs) -> None:
+        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
+        if not exprs:
+            return
+        self.assertions.extend(exprs)
+        self._pri = None
+        self._since = self.refocus_every
+
     def _refocus(self, assignment):
         snap, _ = build_bool_snapshot(self.assertions, assignment=assignment)
         try:

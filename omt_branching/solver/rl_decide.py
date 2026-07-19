@@ -114,6 +114,22 @@ class SamplingPolicyDecider:
         self._since = self.refocus_every
         self.steps: list = []
 
+    def add_hard(self, *exprs) -> None:
+        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
+        if not exprs:
+            return
+        self.assertions.extend(exprs)
+        self._graph = None
+        self._scores = None
+        self._phases = None
+        self._bmap = {}
+        self._score_by_key = {}
+        self._phase_by_key = {}
+        self._window_defer = False
+        self._window_choice = None
+        self._window_phase = True
+        self._since = self.refocus_every
+
     def _undecided_pairs(self, undecided_keys):
         if self._scores is None or self._scores.numel() == 0:
             return [], []

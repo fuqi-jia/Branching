@@ -54,6 +54,33 @@ def test_learned_arm_matches_native_and_fires():
     assert r["rlimit"] > 0
 
 
+def test_omt_cuts_fed_to_gnn_assertions():
+    """线性搜索 better-cut 会经 add_hard 并入 PolicyDecider 建图断言。"""
+    from omt_branching.solver.interfaces import Sense
+
+    x = z3.Int("x")
+    hard = [x >= 0, x <= 5]
+    obj = x
+    holders = {}
+
+    def factory(assertions):
+        dec = PolicyDecider(
+            BranchingPolicyService(policy=BranchingPolicy()),
+            assertions,
+            refocus_every=50,
+        )
+        holders["dec"] = dec
+        holders["n0"] = len(dec.assertions)
+        return dec
+
+    r = solve_omt_with_decider(hard, obj, Sense.MAX, decider_factory=factory)
+    assert r["value"] == 5
+    assert r["iters"] >= 1
+    dec = holders["dec"]
+    # 每次成功改进都会 add_hard 一次 cut；最后一轮 UNSAT 前至少有 1 条
+    assert len(dec.assertions) > holders["n0"]
+
+
 def test_parse_get_value_after_objective_expr():
     from omt_branching.solver.decide_omt import _parse_get_value, _parse_z3_statistics
 

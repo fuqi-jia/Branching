@@ -69,6 +69,8 @@ def solve_omt_with_decider(
       VSIDS 臂）；否则 ``decider_factory(assertions) -> decider``（learned 臂）。
     - ``attach_propagator=False``：不挂 propagator（check-sat-loop 臂）；忽略
       ``decider_factory``。
+    - 每次 better-cut 写入 Solver 后，若 decider 实现 ``add_hard``，会把 cut 并入 GNN
+      建图断言（不额外 ``prop.add``：单元 cut 本就不注册）。
 
     若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按
     -2.0 处理）；未给定时不做该剪枝。
@@ -119,6 +121,10 @@ def solve_omt_with_decider(
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)
+        # 同步进 GNN 建图断言（若 decider 支持）；不注册到 propagator。
+        add_hard = getattr(prop.decider, "add_hard", None) if prop is not None else None
+        if callable(add_hard):
+            add_hard(cut)
         model_rlimit.append(_stat(s, "rlimit count") - rlimit)
         rlimit += model_rlimit[-1]
 
