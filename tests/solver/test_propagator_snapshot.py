@@ -80,8 +80,46 @@ def test_assignment_and_candidates():
     snap, _ = build_bool_snapshot([z3.Or(a, b)], assignment={atom_key(a): True})
     amap = {bv.var_id: bv for bv in snap.bool_vars}
     assert amap[atom_key(a)].assignment is True
+    assert amap[atom_key(a)].is_candidate is False
     assert amap[atom_key(b)].assignment is None
-    assert set(snap.candidate_bool_ids) == {atom_key(a), atom_key(b)}
+    assert amap[atom_key(b)].is_candidate is True
+    # 已定原子退出候选；子句已满足 → 无 literal 边
+    assert set(snap.candidate_bool_ids) == {atom_key(b)}
+    assert len(snap.clauses) == 1
+    assert snap.clauses[0].is_satisfied is True
+    assert snap.clauses[0].literals == []
+
+
+def test_boolean_bcp_forces_unit_and_prunes_edges():
+    """假文字使子句变单元 → BCP 强制另一原子，并投影边。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    snap, _ = build_bool_snapshot(
+        [z3.Or(a, b)], assignment={atom_key(a): False}
+    )
+    by_id = {bv.var_id: bv for bv in snap.bool_vars}
+    assert by_id[atom_key(a)].assignment is False
+    assert by_id[atom_key(b)].assignment is True   # BCP 强制
+    assert snap.candidate_bool_ids == []
+    assert snap.clauses[0].is_satisfied is True
+    assert snap.search_state.trail_length == 2
+
+
+def test_project_drops_falsified_literals():
+    """未满足子句去掉假文字，保留未定文字。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b, c = x >= 5, x <= 2, x >= 1
+    # 赋值 a=False：Or(a,b,c) 投影为 (b,c)，且不会单元传播
+    snap, _ = build_bool_snapshot(
+        [z3.Or(a, b, c)], assignment={atom_key(a): False}
+    )
+    assert set(snap.candidate_bool_ids) == {atom_key(b), atom_key(c)}
+    assert snap.clauses[0].is_satisfied is None
+    assert {vid for vid, _ in snap.clauses[0].literals} == {
+        atom_key(b), atom_key(c)
+    }
 
 
 def test_build_bool_snapshot_theory_features():
@@ -129,7 +167,7 @@ def test_linear_decomposition_branches():
 
 
 def test_static_cache_reuses_structure_updates_assignment():
-    """同 assertions 二次调用应命中静态缓存，且 assignment 仍正确更新。"""
+    """同 assertions 二次调用应命中静态缓存；有赋值时投影子句为新对象。"""
     clear_bool_snapshot_cache()
     x = z3.Int("x")
     a, b = x >= 5, x <= 2
@@ -139,10 +177,31 @@ def test_static_cache_reuses_structure_updates_assignment():
         asserts, assignment={atom_key(a): True}, stats={"conflicts": 3}
     )
     assert amap1 is amap2  # 静态 amap 复用
-    assert snap1.clauses is snap2.clauses
     assert snap1.theory_atoms is snap2.theory_atoms
+    # 空赋值复用静态子句；有赋值则投影为新列表
+    assert snap1.clauses is not snap2.clauses
+    snap0, _ = build_bool_snapshot(asserts)
+    assert snap0.clauses is snap1.clauses
     by_id = {bv.var_id: bv for bv in snap2.bool_vars}
     assert by_id[atom_key(a)].assignment is True
     assert by_id[atom_key(b)].assignment is None
     assert snap2.search_state.conflict_count == 3
     assert snap1.search_state.conflict_count == 0
+
+
+def test_projected_graph_drops_satisfied_clause_edges():
+    """投影后 GraphBuilder 不再为已满足子句连 literal 边。"""
+    from omt_branching.input.graph_builder import GraphBuilder
+    from omt_branching.interfaces import EdgeType
+
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [z3.Or(a, b)]
+    g0 = GraphBuilder().build(build_bool_snapshot(asserts)[0])
+    g1 = GraphBuilder().build(
+        build_bool_snapshot(asserts, assignment={atom_key(a): True})[0]
+    )
+    assert g0.num_edges(EdgeType.LITERAL_IN_CLAUSE) == 2
+    assert g1.num_edges(EdgeType.LITERAL_IN_CLAUSE) == 0
+    assert g1.meta["candidate_bool_ids"] == [atom_key(b)]

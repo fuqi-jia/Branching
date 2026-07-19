@@ -7,6 +7,10 @@
 - :func:`collect_clause_atoms` —— 仅 CNF 析取子句（|lits|≥2）中的原子（``prop.add``）；
 - :func:`preprocess_assertions` / :func:`prepare_propagator_formula` —— 挂 prop 前轻量预处理。
 
+建图动态投影（``assignment`` / ``fixed``）：
+- :func:`build_bool_snapshot` 在非空赋值下做布尔单元传播闭包，再投影子句边、
+  剪掉已定候选，供 GNN 在当前部分赋值下重建图（不调用 z3 理论引擎）。
+
 性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
 from __future__ import annotations
@@ -422,40 +426,154 @@ def _get_static(assertions) -> _StaticBoolSnapshot:
     return static
 
 
+def _lit_truth(assignment: dict, key: str, pos: bool) -> Optional[bool]:
+    """文字 ``(key, pos)`` 在赋值下：True=已满足，False=已假，None=未定。"""
+    if key not in assignment:
+        return None
+    val = bool(assignment[key])
+    return val if pos else (not val)
+
+
+def _boolean_bcp(clauses: list[ClauseInfo], assignment: dict) -> dict:
+    """在子句骨架上对 ``assignment`` 做布尔单元传播闭包（不改动入参、不调 z3）。"""
+    asg = dict(assignment)
+    changed = True
+    while changed:
+        changed = False
+        for c in clauses:
+            undecided: list[tuple[str, bool]] = []
+            sat = False
+            for k, p in c.literals:
+                t = _lit_truth(asg, k, p)
+                if t is True:
+                    sat = True
+                    break
+                if t is None:
+                    undecided.append((k, p))
+            if sat or len(undecided) != 1:
+                continue
+            k, p = undecided[0]
+            forced = bool(p)
+            if k not in asg:
+                asg[k] = forced
+                changed = True
+    return asg
+
+
+def _project_clauses(clauses: list[ClauseInfo], assignment: dict) -> list[ClauseInfo]:
+    """按赋值投影子句：已满足者清空边；未满足者去掉假文字；全假标冲突。"""
+    out: list[ClauseInfo] = []
+    for c in clauses:
+        sat = False
+        remaining: list[tuple] = []
+        for k, p in c.literals:
+            t = _lit_truth(assignment, k, p)
+            if t is True:
+                sat = True
+                break
+            if t is None:
+                remaining.append((k, p))
+        if sat:
+            out.append(ClauseInfo(
+                clause_id=c.clause_id,
+                literals=[],
+                kind=c.kind,
+                lbd=c.lbd,
+                activity=c.activity,
+                is_satisfied=True,
+            ))
+        else:
+            out.append(ClauseInfo(
+                clause_id=c.clause_id,
+                literals=remaining,
+                kind=c.kind,
+                lbd=c.lbd,
+                activity=c.activity,
+                is_satisfied=False if not remaining else None,
+            ))
+    return out
+
+
+def _occ_from_clauses(clauses: list[ClauseInfo], atom_keys: list[str]):
+    """从投影后的活跃子句重算出现统计（已满足子句不计）。"""
+    occ = {k: 0 for k in atom_keys}
+    pos = {k: 0 for k in atom_keys}
+    neg = {k: 0 for k in atom_keys}
+    for c in clauses:
+        if c.is_satisfied:
+            continue
+        for k, p in c.literals:
+            if k not in occ:
+                continue
+            occ[k] += 1
+            if p:
+                pos[k] += 1
+            else:
+                neg[k] += 1
+    return occ, pos, neg
+
+
 def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
                         stats: Optional[dict] = None, snapshot_id: str = "prop"):
     """构造 SolverSnapshot。
 
-    静态部分（原子/子句/理论特征）按 ``assertions`` 缓存；每次调用只根据
-    ``assignment`` / ``stats`` 填充动态字段。
+    静态部分（原子/子句/理论特征）按 ``assertions`` 缓存。
+    ``assignment`` 非空时：布尔 BCP 闭包 → 投影子句边 → 剪掉已定候选，重建动态图视图；
+    空赋值时直接复用静态子句对象（零拷贝）。
     """
     assignment = assignment or {}
     stats = stats or {}
     static = _get_static(list(assertions))
 
-    bool_vars = [
-        BooleanVarInfo(
-            var_id=k,
-            assignment=assignment.get(k),
-            is_candidate=True,
-            occurrence_count=static.occ[k],
-            pos_count=static.pos[k],
-            neg_count=static.neg[k],
-        )
-        for k in static.atom_keys
-    ]
+    if not assignment:
+        bool_vars = [
+            BooleanVarInfo(
+                var_id=k,
+                assignment=None,
+                is_candidate=True,
+                occurrence_count=static.occ[k],
+                pos_count=static.pos[k],
+                neg_count=static.neg[k],
+            )
+            for k in static.atom_keys
+        ]
+        clauses = static.clauses
+        candidates = list(static.atom_keys)
+        trail_len = 0
+    else:
+        asg = _boolean_bcp(static.clauses, assignment)
+        clauses = _project_clauses(static.clauses, asg)
+        occ, pos, neg = _occ_from_clauses(clauses, static.atom_keys)
+        bool_vars = []
+        candidates = []
+        for k in static.atom_keys:
+            val = asg.get(k)
+            fixed = val is not None
+            bool_vars.append(BooleanVarInfo(
+                var_id=k,
+                assignment=val,
+                is_candidate=not fixed,
+                is_eliminated=False,
+                occurrence_count=occ[k],
+                pos_count=pos[k],
+                neg_count=neg[k],
+            ))
+            if not fixed:
+                candidates.append(k)
+        trail_len = len(asg)
+
     search_state = SearchStateInfo(
         decision_level=int(stats.get("decisions", 0)),
         conflict_count=int(stats.get("conflicts", 0)),
-        trail_length=len(assignment),
+        trail_length=trail_len,
     )
     snap = SolverSnapshot(
         bool_vars=bool_vars,
-        clauses=static.clauses,
+        clauses=clauses,
         theory_atoms=static.theory_atoms,
         numeric_vars=static.numeric_vars,
         search_state=search_state,
-        candidate_bool_ids=list(static.atom_keys),
+        candidate_bool_ids=candidates,
         candidate_numeric_ids=[],
         snapshot_id=snapshot_id,
     )
