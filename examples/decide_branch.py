@@ -364,7 +364,7 @@ def main() -> None:
         "--rl-workers",
         type=int,
         default=DEFAULT_RL_COLLECT_WORKERS,
-        help="RL collect 线程数（默认 4；实例数<8 时自动串行；GNN 排队用全部 GPU；与 --test-workers 独立）",
+        help="RL collect 进程数（默认 4；实例数<8 时自动串行；GNN 经主进程排队用全部 GPU；与 --test-workers 独立）",
     )
     ap.add_argument(
         "--ckpt-dir",
@@ -524,7 +524,7 @@ def main() -> None:
             ),
         )
         mode = (
-            f"线程并行×{rl_workers}（GNN 排队全 GPU）"
+            f"进程并行×{rl_workers}（GNN 主进程排队全 GPU）"
             if rl_workers > 1
             else "串行 collect"
         )

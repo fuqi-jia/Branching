@@ -130,7 +130,7 @@ def test_decide_rl_sat_collect_update():
 
 
 def test_decide_rl_parallel_collect():
-    """多线程 collect + GpuInferPool 排队推理 + 主线程 update。"""
+    """多进程 collect + GpuInferService 排队推理 + 主进程 update。"""
     from omt_branching.solver import generate_bool_lia_dataset
     from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
 
@@ -155,8 +155,6 @@ def test_decide_rl_parallel_collect():
     # train_end 汇总一条
     assert len(hist) == 9
     assert all(h.get("steps", 0) >= 0 for h in hist if "steps" in h)
-    assert tr._infer_pool is not None
-    assert len(tr._infer_pool.devices) >= 1
 
 
 def test_gpu_infer_pool_queues_slots():
@@ -188,4 +186,47 @@ def test_gpu_infer_pool_queues_slots():
     s2, p2 = pool.infer(g)
     assert s1.shape == s2.shape == (2,)
     assert p1.shape == p2.shape == (2,)
+
+
+def test_gpu_infer_service_remote_client():
+    """主进程 GpuInferService + RemoteInferClient（Queue + Pipe）。"""
+    import multiprocessing as mp
+
+    from omt_branching.input.graph_builder import GraphBuilder
+    from omt_branching.input.solver_state import (
+        BooleanVarInfo,
+        ClauseInfo,
+        ObjectiveInfo,
+        SearchStateInfo,
+        SolverSnapshot,
+    )
+    from omt_branching.solver.rl_decide import GpuInferService, RemoteInferClient
+
+    ctx = mp.get_context("spawn")
+    req = ctx.Queue()
+    policy = BranchingPolicy()
+    svc = GpuInferService.from_policy(
+        policy, req, device="cpu", use_all_gpus=False
+    )
+    svc.start()
+    try:
+        client = RemoteInferClient(req, ctx)
+        snap = SolverSnapshot(
+            bool_vars=[
+                BooleanVarInfo(var_id="a", is_candidate=True),
+                BooleanVarInfo(var_id="b", is_candidate=True),
+            ],
+            clauses=[
+                ClauseInfo(clause_id="c0", literals=[("a", True), ("b", False)])
+            ],
+            objective=ObjectiveInfo(objective_id="obj"),
+            search_state=SearchStateInfo(),
+            candidate_bool_ids=["a", "b"],
+        )
+        g = GraphBuilder().build(snap)
+        s, p = client.infer(g)
+        assert s.shape == (2,)
+        assert p.shape == (2,)
+    finally:
+        svc.stop()
 
