@@ -1,10 +1,11 @@
 """Decide 层 RL：采样式 decider（含 defer-to-VSIDS 动作）+ REINFORCE 训练器。
 
-**窗口粘性**（``sticky_window=True``，训练默认）：每个 ``refocus_every`` 窗口只跑一次
-GNN，对 ``[defer, 当时未定原子]`` 采样一次并记一条 REINFORCE step；窗口内后续 decide
-不再采样/进 torch——defer 则整窗放行 VSIDS，否则粘性返回采样原子，已定后按缓存分数贪心。
+**窗口粘性**（``sticky_window=True``）：每个 ``refocus_every`` 窗口只跑一次 GNN，对
+``[defer, 当时未定原子]`` 采样一次并记一条 REINFORCE step；窗口内后续 decide 不再
+采样/进 torch——defer 则整窗放行 VSIDS，否则粘性返回采样原子，已定后按缓存分数贪心。
 
-``sticky_window=False`` 恢复旧行为（每次 decide 都采样并记 step）。
+``sticky_window=False``（``DecideRLConfig`` / ``decide_branch`` 训练默认）：每次
+decide 都采样并记 step。
 
 冲突回退（propagator ``pop`` → :meth:`SamplingPolicyDecider.on_backtrack`，默认开启）
 会清空粘性窗并强制下次 decide 立刻 refocus。
@@ -22,11 +23,12 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import random
 import threading
 import traceback
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, Sequence
 
 import torch
 
@@ -316,6 +318,7 @@ def _rl_collect_worker(task: tuple) -> tuple:
         defer_val,
         refocus_every,
         max_iters,
+        sticky_window,
         smt2_path,
         instance_id,
         ref_value,
@@ -352,6 +355,7 @@ def _rl_collect_worker(task: tuple) -> tuple:
             refocus_every,
             sample=True,
             device="cpu",
+            sticky_window=bool(sticky_window),
             infer_pool=client,
         )
         holder["d"] = d
@@ -384,7 +388,7 @@ class SamplingPolicyDecider:
         sample: bool = True,
         device: str | torch.device = "cpu",
         *,
-        sticky_window: bool = True,
+        sticky_window: bool = False,
         refocus_on_backtrack: bool = True,
         infer_pool: InferBackend | None = None,
     ):
@@ -395,7 +399,7 @@ class SamplingPolicyDecider:
         self.assertions = list(assertions)
         self.refocus_every = max(1, refocus_every)
         self.sample = sample
-        # True：每窗只采样/记 step 一次，其后按缓存分数立即返回（训练默认）
+        # True：每窗只采样/记 step 一次，其后按缓存分数立即返回
         self.sticky_window = sticky_window
         self.refocus_on_backtrack = refocus_on_backtrack
         self._graph = None
@@ -579,6 +583,10 @@ class DecideRLConfig:
     min_instances_for_parallel: int = MIN_INSTANCES_FOR_RL_PARALLEL
     #: 并行 collect 时是否把全部 CUDA 设备纳入 :class:`GpuInferPool`
     use_all_gpus: bool = True
+    #: 窗口粘性；False 时每次 decide 采样并记 step（训练默认）
+    sticky_window: bool = False
+    #: 每轮 collect 的实例数；None / ≤0 / ≥训练集大小则整集 collect
+    collect_batch_size: int | None = None
 
 
 @dataclass
@@ -643,6 +651,7 @@ class DecideRLTrainer:
                 self.config.refocus_every,
                 sample=True,
                 device=self.config.device,
+                sticky_window=self.config.sticky_window,
                 infer_pool=pool,
             )
             holder["d"] = d
@@ -667,7 +676,7 @@ class DecideRLTrainer:
 
     def _collect_parallel(
         self,
-        count: int,
+        indices: Sequence[int],
         *,
         seed: int,
         hard: bool,
@@ -682,15 +691,14 @@ class DecideRLTrainer:
         ref_values: list | None = None,
         ref_rlimits: list[int | None] | None = None,
     ) -> list[tuple[int, list, float, dict]]:
-        """多进程 collect：z3 并行；GNN 经主进程 GpuInferService 排队占满 GPU。"""
+        """多进程 collect：仅对 ``indices`` 中的实例；GNN 经主进程 GpuInferService。"""
         infer_service.sync_from(self.policy)
         defer_val = float(self.defer_logit.detach().cpu())
-        paths = smt2_paths or [None] * count
-        ids = instance_ids or [None] * count
-        vals = ref_values if ref_values is not None else [None] * count
-        rls = ref_rlimits if ref_rlimits is not None else [None] * count
-        if not (len(paths) == len(ids) == len(vals) == len(rls) == count):
-            raise ValueError("smt2_paths / instance_ids / ref_* 长度必须等于实例数")
+        sticky = self.config.sticky_window
+        paths = smt2_paths
+        ids = instance_ids
+        vals = ref_values
+        rls = ref_rlimits
         tasks = [
             (
                 j,
@@ -701,24 +709,42 @@ class DecideRLTrainer:
                 defer_val,
                 self.config.refocus_every,
                 self.config.max_iters,
-                paths[j],
-                ids[j],
-                vals[j],
-                rls[j],
+                sticky,
+                None if paths is None else paths[j],
+                None if ids is None else ids[j],
+                None if vals is None else vals[j],
+                None if rls is None else rls[j],
             )
-            for j in range(count)
+            for j in indices
         ]
         results: list[tuple[int, list, float, dict]] = []
         futures = [pool.submit(_rl_collect_worker, t) for t in tasks]
         done = 0
+        total = len(indices)
         for fut in as_completed(futures):
             results.append(fut.result())
             done += 1
             if pbar is not None:
                 pbar.update(1)
-                pbar.set_postfix(iter=iter_idx, phase="collect", inst=f"{done}/{count}")
+                pbar.set_postfix(
+                    iter=iter_idx, phase="collect", inst=f"{done}/{total}"
+                )
         results.sort(key=lambda x: x[0])
         return results
+
+    @staticmethod
+    def _iter_indices(
+        count: int,
+        batch_size: int | None,
+        *,
+        seed: int,
+        iter_idx: int,
+    ) -> list[int]:
+        """本轮要 collect 的实例下标；``batch_size`` 空/过大则整集。"""
+        if batch_size is None or batch_size <= 0 or batch_size >= count:
+            return list(range(count))
+        rng = random.Random(seed + iter_idx * 100_003)
+        return rng.sample(range(count), batch_size)
 
     def save_checkpoint(self, path, *, meta: dict | None = None) -> None:
         """保存策略权重 + ``defer_logit``（写入 ``meta``）。"""
@@ -743,6 +769,7 @@ class DecideRLTrainer:
                 self.config.refocus_every,
                 sample=True,
                 device=self.config.device,
+                sticky_window=self.config.sticky_window,
             )
             holder["d"] = d
             return d
@@ -819,18 +846,22 @@ class DecideRLTrainer:
         instance_ids: list[str] | None = None,
         ref_values: list | None = None,
         ref_rlimits: list[int | None] | None = None,
+        collect_batch_size: int | None = None,
         checkpoint_dir: str | None = None,
         checkpoint_every: int = 1,
         eval_callback: Callable[[int, "DecideRLTrainer"], dict] | None = None,
         early_stop: EarlyStopConfig | None = None,
     ):
-        """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。
+        """REINFORCE 训练。``workers>1`` 且本轮实例数足够时用 spawn 进程池并行 collect。
 
         并行时主进程启动 :class:`GpuInferService`，经 Queue 排队占用全部 GPU 做
         GNN 推理；Z3 在子进程中运行，与其它实例的 infer 重叠。``smt2_paths`` 非空
         时 worker 从落盘文件读实例，否则按 seed 重建。``ref_values`` /
         ``ref_rlimits`` 为各实例的 ``ref/`` 缓存参考。``checkpoint_dir`` 非空时每隔
         ``checkpoint_every`` 轮保存中间权重。
+
+        ``collect_batch_size``（或 ``config.collect_batch_size``）限制每轮 collect
+        的实例数；未设则整集。``sticky_window`` 见 :class:`DecideRLConfig`。
 
         ``iterations=-1`` 时训练直到 ``early_stop`` 判定收敛（须提供
         ``eval_callback`` + ``early_stop``）；``iterations>0`` 时最多跑该轮数，
@@ -863,9 +894,18 @@ class DecideRLTrainer:
 
         vals = ref_values if ref_values is not None else [None] * count
         rls = ref_rlimits if ref_rlimits is not None else [None] * count
+        batch_cfg = (
+            collect_batch_size
+            if collect_batch_size is not None
+            else self.config.collect_batch_size
+        )
+        # 用「每轮最多 collect 数」决定是否值得起进程池
+        per_iter_cap = count
+        if batch_cfg is not None and batch_cfg > 0:
+            per_iter_cap = min(batch_cfg, count)
         requested = workers if workers is not None else self.config.workers
         n_workers = effective_rl_workers(
-            count,
+            per_iter_cap,
             requested,
             min_instances=self.config.min_instances_for_parallel,
         )
@@ -904,13 +944,16 @@ class DecideRLTrainer:
             return (best - curr) / scale > early_stop.tol
 
         try:
-            pbar_total = max_rounds * count if iterations != -1 else None
+            pbar_total = max_rounds * per_iter_cap if iterations != -1 else None
             with tqdm(total=pbar_total, desc="rl_train") as pbar:
                 for it in range(max_rounds):
+                    indices = self._iter_indices(
+                        count, batch_cfg, seed=collect_seed, iter_idx=it
+                    )
                     if use_parallel:
                         assert proc_pool is not None and infer_service is not None
                         batch = self._collect_parallel(
-                            count,
+                            indices,
                             seed=collect_seed,
                             hard=collect_hard,
                             min_vars=collect_min_vars,
@@ -949,10 +992,11 @@ class DecideRLTrainer:
                             pbar.set_postfix(
                                 iter=it,
                                 phase="update",
-                                inst=f"{upd_i + 1}/{count}",
+                                inst=f"{upd_i + 1}/{len(indices)}",
                             )
                     else:
-                        for j, (hard, obj, sense) in enumerate(instances):
+                        for j in indices:
+                            hard, obj, sense = instances[j]
                             steps, reward, res = self.collect(
                                 hard,
                                 obj,
@@ -1078,6 +1122,8 @@ class DecideRLTrainer:
                 ),
                 "eval_history": eval_history,
                 "defer_logit": float(self.defer_logit.detach().cpu()),
+                "collect_batch_size": batch_cfg,
+                "sticky_window": self.config.sticky_window,
             }
         )
         return history

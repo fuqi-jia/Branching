@@ -31,15 +31,14 @@ from pathlib import Path
 import torch
 
 from omt_branching.model.device import gnn_device
-from omt_branching.model.inference import InferenceConfig
 from omt_branching.model.persistence import save_history
 from omt_branching.model.policy import BranchingPolicy
-from omt_branching.service import BranchingPolicyService, ServiceConfig
 from omt_branching.solver.rl_decide import (
     DEFAULT_RL_COLLECT_WORKERS,
     DecideRLConfig,
     DecideRLTrainer,
     EarlyStopConfig,
+    SamplingPolicyDecider,
     decide_rl_reward,
     effective_rl_workers,
 )
@@ -61,7 +60,6 @@ from omt_branching.solver.binary_results import (
     vsids_stats_from_ref,
 )
 from omt_branching.solver.instance_gen import OMTInstance
-from omt_branching.solver.policy_decider import PolicyDecider
 
 from tqdm import tqdm
 
@@ -142,6 +140,32 @@ def _require_binary_cache(dataset_dir: str, split: str, entries: list[dict]) -> 
         )
 
 
+def _make_eval_decider_factory(
+    policy: BranchingPolicy,
+    device: str,
+    refocus: int,
+    defer_logit: float,
+    sticky_window: bool,
+):
+    """验证/测试：与训练同构的 SamplingPolicyDecider，``sample=False``（可 defer）。"""
+    defer = torch.nn.Parameter(
+        torch.tensor(float(defer_logit), dtype=torch.float32, device=device)
+    )
+
+    def factory(assertions):
+        return SamplingPolicyDecider(
+            policy,
+            defer,
+            assertions,
+            refocus,
+            sample=False,
+            device=device,
+            sticky_window=sticky_window,
+        )
+
+    return factory
+
+
 def _eval_test_worker(task: tuple) -> dict:
     """ProcessPool worker：ref 缓存取 binary/VSIDS/check-sat-loop，现场只跑 learned。"""
     (
@@ -151,6 +175,8 @@ def _eval_test_worker(task: tuple) -> dict:
         policy_state,
         device,
         refocus,
+        defer_logit,
+        sticky_window,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
 
@@ -164,15 +190,13 @@ def _eval_test_worker(task: tuple) -> dict:
     policy.load_state_dict(policy_state)
     policy.to(device)
     policy.eval()
-    svc = BranchingPolicyService(
-        policy=policy,
-        config=ServiceConfig(inference=InferenceConfig(device=device)),
-    )
     ln = solve_omt_with_decider(
         hard,
         obj,
         sense,
-        decider_factory=lambda a: PolicyDecider(svc, a, refocus),
+        decider_factory=_make_eval_decider_factory(
+            policy, device, refocus, defer_logit, sticky_window
+        ),
     )
     return {
         "instance_id": inst.instance_id,
@@ -193,6 +217,8 @@ def _eval_val_worker(task: tuple) -> dict:
         policy_state,
         device,
         refocus,
+        defer_logit,
+        sticky_window,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
 
@@ -205,15 +231,13 @@ def _eval_val_worker(task: tuple) -> dict:
     policy.load_state_dict(policy_state)
     policy.to(device)
     policy.eval()
-    svc = BranchingPolicyService(
-        policy=policy,
-        config=ServiceConfig(inference=InferenceConfig(device=device)),
-    )
     ln = solve_omt_with_decider(
         hard,
         obj,
         sense,
-        decider_factory=lambda a: PolicyDecider(svc, a, refocus),
+        decider_factory=_make_eval_decider_factory(
+            policy, device, refocus, defer_logit, sticky_window
+        ),
         ref_rlimit=ref_rl,
     )
     reward = decide_rl_reward(ln, ref_val, ref_rl)
@@ -239,6 +263,8 @@ def _run_test_parallel(
     workers: int,
     *,
     split: str = "test",
+    defer_logit: float = 0.0,
+    sticky_window: bool = False,
 ) -> list[dict]:
     """并发跑测试集（进程池；binary 读缓存；每 worker 从 smt2 加载）。"""
     policy_state = _policy_state_cpu(policy)
@@ -258,6 +284,8 @@ def _run_test_parallel(
             policy_state,
             worker_device,
             refocus,
+            float(defer_logit),
+            bool(sticky_window),
         ))
     by_id: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -279,6 +307,8 @@ def _run_val_parallel(
     workers: int,
     *,
     split: str = "eval",
+    defer_logit: float = 0.0,
+    sticky_window: bool = False,
 ) -> dict:
     """在验证集上评估 learned 臂，返回聚合指标（供早停）。"""
     if not entries:
@@ -300,6 +330,8 @@ def _run_val_parallel(
             policy_state,
             worker_device,
             refocus,
+            float(defer_logit),
+            bool(sticky_window),
         ))
     rows: list[dict] = []
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -367,6 +399,17 @@ def main() -> None:
         help="RL collect 进程数（默认 4；实例数<8 时自动串行；GNN 经主进程排队用全部 GPU；与 --test-workers 独立）",
     )
     ap.add_argument(
+        "--rl-collect-batch",
+        type=int,
+        default=None,
+        help="每轮 RL collect 的实例数（默认整集）；小于训练集时每轮随机抽样后再 update",
+    )
+    ap.add_argument(
+        "--sticky-window",
+        action="store_true",
+        help="启用窗口粘性（默认关闭：每次 decide 采样/argmax 并记 step）",
+    )
+    ap.add_argument(
         "--ckpt-dir",
         default=DEFAULT_CKPT_DIR,
         help="RL 中间 checkpoint 目录",
@@ -416,11 +459,15 @@ def main() -> None:
         raise SystemExit("--rl-iters 须为 -1、0 或正整数")
     if args.rl_iters == -1 and args.no_early_stop:
         raise SystemExit("--rl-iters=-1 必须启用早停（勿加 --no-early-stop）")
+    if args.rl_collect_batch is not None and args.rl_collect_batch <= 0:
+        raise SystemExit("--rl-collect-batch 须为正整数（或省略表示整集）")
 
     dataset_dir = DEFAULT_DATASET_DIR
     device = args.device or gnn_device()
     print(f"GNN device: {device}")
     print(f"数据集目录: {dataset_dir}")
+    sticky_window = bool(args.sticky_window)
+    print(f"sticky_window={sticky_window}（验证/测试与训练一致）")
 
     z3_path = args.z3_path or shutil.which("z3")
     if not z3_path:
@@ -461,6 +508,7 @@ def main() -> None:
         _require_binary_cache(dataset_dir, "eval", eval_entries)
 
     policy = BranchingPolicy()
+    test_defer_logit = 0.0
     if args.imitation:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
         from omt_branching.solver.training_data import (
@@ -514,13 +562,17 @@ def main() -> None:
             binary_rlimit(dataset_dir, iid, split="train") for iid in rl_ids
         ]
 
-        rl_workers = effective_rl_workers(len(rl_train), args.rl_workers)
+        rl_batch = args.rl_collect_batch
+        per_iter = len(rl_train) if rl_batch is None else min(rl_batch, len(rl_train))
+        rl_workers = effective_rl_workers(per_iter, args.rl_workers)
         rlt = DecideRLTrainer(
             policy,
             DecideRLConfig(
                 refocus_every=args.refocus,
                 device=device,
                 workers=rl_workers,
+                sticky_window=sticky_window,
+                collect_batch_size=rl_batch,
             ),
         )
         mode = (
@@ -533,9 +585,15 @@ def main() -> None:
             if args.rl_iters == -1
             else f"最多 {args.rl_iters} 轮"
         )
+        batch_desc = (
+            f"每轮 collect={per_iter}/{len(rl_train)}"
+            if rl_batch is not None
+            else f"每轮整集 {len(rl_train)}"
+        )
         print(
-            f"RL collect: {len(rl_train)} 实例 × {iters_desc}, {mode} "
+            f"RL collect: {batch_desc} × {iters_desc}, {mode} "
             f"(请求 workers={args.rl_workers})；update 设备={device}；"
+            f"sticky_window={sticky_window}；"
             f"reward 使用 ref/ 缓存（value←binary；rlimit←公平 vsids 若命中最优）"
         )
         print(f"RL checkpoints -> {args.ckpt_dir}/ (every {args.ckpt_every})")
@@ -572,6 +630,8 @@ def main() -> None:
                     args.refocus,
                     args.test_workers,
                     split="eval",
+                    defer_logit=float(trainer.defer_logit.detach().cpu()),
+                    sticky_window=sticky_window,
                 )
                 print(
                     f"[val it={finished_iters}] mean_reward={metrics['mean_reward']:.4f} "
@@ -590,6 +650,7 @@ def main() -> None:
             instance_ids=rl_ids,
             ref_values=rl_ref_values,
             ref_rlimits=rl_ref_rlimits,
+            collect_batch_size=rl_batch,
             checkpoint_dir=args.ckpt_dir,
             checkpoint_every=args.ckpt_every,
             eval_callback=eval_cb,
@@ -627,6 +688,7 @@ def main() -> None:
                 f"conflicts={last_step.get('conflicts')}, "
                 f"steps={last_step.get('steps')}"
             )
+        test_defer_logit = float(rlt.defer_logit.detach().cpu())
 
     _solver_arm = {
         "rlimit": 0.0,
@@ -658,6 +720,8 @@ def main() -> None:
         device,
         args.refocus,
         args.test_workers,
+        defer_logit=test_defer_logit,
+        sticky_window=sticky_window,
     )
     for row in rows:
         ref_val = row["ref_val"]
@@ -706,6 +770,8 @@ def main() -> None:
         "z3_path": z3_path,
         "device": device,
         "test_workers": args.test_workers,
+        "defer_logit": test_defer_logit,
+        "sticky_window": sticky_window,
         "per_instance": per_instance,
     }
     results_path = os.path.join(ARTIFACTS, "results.json")

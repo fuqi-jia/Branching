@@ -73,8 +73,9 @@ def solve_omt_with_decider(
       建图断言，并刷新根级 ``consequences`` 强制赋值（跨 cut 简化建图）；不额外
       ``prop.add``：单元 cut 本就不注册。
 
-    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按
-    -2.0 处理）；未给定时不做该剪枝。
+    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时提前返回（未达最优时
+    reward 侧多为 -1.0）；未给定时不做该剪枝。训练 collect 与验证均应传入参考
+    ``ref_rlimit`` 以加速无望实例。
     """
     if ctx is None:
         ctx = z3.Context()
@@ -114,11 +115,7 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
-        if (
-            sample
-            and ref_rlimit is not None
-            and rlimit - solver_rlimit > 2 * ref_rlimit
-        ):
+        if ref_rlimit is not None and rlimit - solver_rlimit > 2 * ref_rlimit:
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)

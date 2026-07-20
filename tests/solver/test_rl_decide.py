@@ -14,7 +14,9 @@ def test_sampling_decider_records_steps_and_valid_choice():
     asserts = [x >= 0, x <= 10, z3.Or(a, b)]
     policy = BranchingPolicy()
     defer = torch.zeros(())
-    dec = SamplingPolicyDecider(policy, defer, asserts, refocus_every=100, sample=True)
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=100, sample=True, sticky_window=True
+    )
     und = [atom_key(a), atom_key(b)]
     torch.manual_seed(0)
     outs = [dec(und, {}) for _ in range(5)]
@@ -155,6 +157,38 @@ def test_decide_rl_parallel_collect():
     # train_end 汇总一条
     assert len(hist) == 9
     assert all(h.get("steps", 0) >= 0 for h in hist if "steps" in h)
+
+
+def test_decide_rl_collect_batch_size():
+    """每轮只 collect 指定 batch，history 步数 = batch（另加 train_end）。"""
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    insts = generate_bool_lia_dataset(8, seed=4, min_vars=5, max_vars=5)
+    tr = DecideRLTrainer(
+        BranchingPolicy(),
+        DecideRLConfig(
+            refocus_every=40,
+            workers=1,
+            collect_batch_size=3,
+            sticky_window=False,
+        ),
+    )
+    hist = tr.train(
+        [i.as_tuple() for i in insts],
+        iterations=2,
+        workers=1,
+        collect_seed=4,
+        collect_min_vars=5,
+        collect_max_vars=5,
+        collect_batch_size=3,
+    )
+    steps = [h for h in hist if "steps" in h and "event" not in h]
+    assert len(steps) == 6  # 2 iters × 3
+    end = hist[-1]
+    assert end.get("event") == "train_end"
+    assert end.get("collect_batch_size") == 3
+    assert end.get("sticky_window") is False
 
 
 def test_gpu_infer_pool_queues_slots():

@@ -1,8 +1,8 @@
 """加载已有策略权重，在数据集 test 划分上做四臂对比并写 ``results.json``。
 
-评测逻辑与 ``examples/decide_branch.py`` 一致（``PolicyDecider`` + ref 缓存参考），
-不训练。默认权重 ``examples/artifacts/rl_decide_policy.pt``，默认数据
-``examples/artifacts/dataset``。
+评测逻辑与 ``examples/decide_branch.py`` 一致（``SamplingPolicyDecider`` +
+``sample=False`` 允许 defer；ref 缓存参考），不训练。默认权重
+``examples/artifacts/rl_decide_policy.pt``，默认数据 ``examples/artifacts/dataset``。
 
 运行::
 
@@ -73,6 +73,17 @@ def main() -> None:
         default=None,
         help="GNN 设备（默认 cuda 可用则 cuda，否则 cpu）",
     )
+    ap.add_argument(
+        "--sticky-window",
+        action="store_true",
+        help="启用窗口粘性（默认关闭，与 decide_branch 训练默认一致）",
+    )
+    ap.add_argument(
+        "--defer-logit",
+        type=float,
+        default=None,
+        help="覆盖 checkpoint meta 中的 defer_logit（默认读 meta，否则 0）",
+    )
     args = ap.parse_args()
 
     ckpt_path = Path(args.checkpoint)
@@ -102,10 +113,16 @@ def main() -> None:
     policy, meta = load_policy(ckpt_path, map_location="cpu")
     policy.to(device)
     policy.eval()
+    if args.defer_logit is not None:
+        defer_logit = float(args.defer_logit)
+    else:
+        defer_logit = float(meta.get("defer_logit", 0.0)) if meta else 0.0
+    sticky_window = bool(args.sticky_window)
     if meta:
-        defer = meta.get("defer_logit")
-        extra = f", defer_logit={defer}" if defer is not None else ""
-        print(f"已加载权重 meta keys={list(meta.keys())}{extra}")
+        print(
+            f"已加载权重 meta keys={list(meta.keys())}, "
+            f"defer_logit={defer_logit}, sticky_window={sticky_window}"
+        )
 
     _solver_arm = {
         "rlimit": 0.0,
@@ -137,6 +154,8 @@ def main() -> None:
         device,
         args.refocus,
         args.test_workers,
+        defer_logit=defer_logit,
+        sticky_window=sticky_window,
     )
     for row in rows:
         ref_val = row["ref_val"]
@@ -193,6 +212,8 @@ def main() -> None:
         "device": device,
         "test_workers": args.test_workers,
         "per_instance": per_instance,
+        "defer_logit": defer_logit,
+        "sticky_window": sticky_window,
         # 评测专用溯源（decide_branch 无此字段）
         "checkpoint": str(ckpt_path.resolve()),
         "checkpoint_meta": {k: _json_value(v) for k, v in meta.items()},
