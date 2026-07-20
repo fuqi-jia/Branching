@@ -63,6 +63,9 @@ from omt_branching.solver.lookahead_cache import (
 )
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat, generate_hard_smt_lia
 from omt_branching.solver.sat_solve import solve_sat_with_decider
+from omt_branching.solver.vsids_trace import (
+    VSIDSTraceConfig, build_vsids_examples_sat, collect_vsids_trajectory,
+)
 from omt_branching.solver.strong_branch import (
     StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
     strong_branch_numeric_scores, strong_branch_scores,
@@ -162,4 +165,7 @@ __all__ = [
     "generate_rand_3sat",
     "generate_hard_smt_lia",
     "solve_sat_with_decider",
+    "VSIDSTraceConfig",
+    "build_vsids_examples_sat",
+    "collect_vsids_trajectory",
 ]

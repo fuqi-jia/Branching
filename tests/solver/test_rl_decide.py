@@ -108,6 +108,51 @@ def test_decide_rl_sat_collect_update():
     assert math.isfinite(stats["loss"])
 
 
+def test_sat_conflict_reward_normalized_and_monotone():
+    """归一化 reward 恒 [-1,0]:0=零冲突,-0.5=与 VSIDS 持平,-1=≥2×ref;单调、有界。"""
+    from omt_branching.solver.rl_decide import sat_conflict_reward
+
+    assert sat_conflict_reward(0, 100) == 0.0
+    assert sat_conflict_reward(100, 100, cap=2.0) == -0.5
+    assert sat_conflict_reward(200, 100, cap=2.0) == -1.0
+    assert sat_conflict_reward(10_000, 100) == -1.0          # 有界:离群不爆
+    for c in (0, 1, 50, 100, 300, 5000):
+        assert -1.0 <= sat_conflict_reward(c, 100) <= 0.0
+    rs = [sat_conflict_reward(c, 100) for c in (0, 10, 50, 100, 200)]
+    assert all(a >= b for a, b in zip(rs, rs[1:]))           # 单调不增
+    # 无参考 → ref=1 保守惩罚
+    assert sat_conflict_reward(0, None) == 0.0
+    assert sat_conflict_reward(5, None) == -1.0
+
+
+def test_collect_sat_reward_in_unit_interval():
+    from omt_branching.solver.sat_instances import generate_rand_3sat
+    from omt_branching.solver.sat_solve import solve_sat_with_decider
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    atoms, clauses = generate_rand_3sat(24, 4.26, seed=2)
+    ref = solve_sat_with_decider(clauses, atoms, None)["conflicts"]
+    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=40))
+    steps, reward, res = tr.collect_sat(clauses, atoms, ref_conflicts=ref)
+    assert -1.0 <= reward <= 0.0
+    stats = tr.update(steps, reward, key=0)
+    assert stats["steps"] >= 0
+
+
+def test_train_sat_normalized_reward_history():
+    from omt_branching.solver.sat_instances import generate_rand_3sat
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    probs = [generate_rand_3sat(20, 4.26, seed=s) for s in (1, 2)]
+    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=40))
+    hist = tr.train_sat(probs, iterations=1)
+    assert len(hist) == 2
+    for h in hist:
+        assert -1.0 <= h["reward"] <= 0.0
+        assert h["ref_conflicts"] >= 0
+        assert "conflicts" in h
+
+
 def test_decide_rl_parallel_collect():
     """多进程 collect + 主进程 update。"""
     from omt_branching.solver import generate_bool_lia_dataset
