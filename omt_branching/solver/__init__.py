@@ -45,8 +45,10 @@ from omt_branching.solver.propagator_snapshot import (
     clear_bool_snapshot_cache,
     collect_atoms,
     collect_clause_atoms,
+    merge_root_assignment,
     prepare_propagator_formula,
     preprocess_assertions,
+    root_forced_assignment,
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learned_policy
@@ -147,6 +149,8 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "root_forced_assignment",
+    "merge_root_assignment",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
     "LearnedDecidePropagator",

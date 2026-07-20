@@ -10,6 +10,9 @@
 建图动态投影（``assignment`` / ``fixed``）：
 - :func:`build_bool_snapshot` 在非空赋值下做布尔单元传播闭包，再投影子句边、
   剪掉已定候选，供 GNN 在当前部分赋值下重建图（不调用 z3 理论引擎）。
+- :func:`root_forced_assignment` —— OMT better-cut 后在根状态用 ``consequences``
+  求硬断言强制的原子赋值；经 :func:`merge_root_assignment` 并入搜索 trail，
+  供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。
 
 性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
@@ -215,6 +218,62 @@ def prepare_propagator_formula(assertions) -> tuple[list, list]:
     """
     pp = preprocess_assertions(assertions)
     return pp, collect_clause_atoms(pp)
+
+
+def _consequence_literal_assignment(imps) -> dict[str, bool]:
+    """从 ``consequences`` 的 implication 列表得到 ``原子键 -> 强制真值``。"""
+    out: dict[str, bool] = {}
+    for imp in imps:
+        cons = imp.arg(1) if (z3.is_implies(imp) and imp.num_args() == 2) else imp
+        pos = True
+        e = cons
+        while z3.is_not(e):
+            pos = not pos
+            e = e.arg(0)
+        if _is_atom(e):
+            out[atom_key(e)] = pos
+    return out
+
+
+def root_forced_assignment(
+    assertions,
+    atoms=None,
+    *,
+    max_atoms: Optional[int] = None,
+) -> dict[str, bool]:
+    """根状态（无决策假设）下，用 z3 ``consequences`` 求被硬断言强制的原子赋值。
+
+    典型用途：OMT 线性搜索每次 better-cut 并入断言后，刷新根级 forced 集合，
+    再经 :func:`merge_root_assignment` 喂给 :func:`build_bool_snapshot`，投影子句并
+    剪掉已定候选。失败或无原子时返回空 dict（不影响后续求解）。
+    """
+    assertions = list(assertions)
+    if not assertions:
+        return {}
+    atom_exprs = list(atoms) if atoms is not None else collect_atoms(assertions)
+    if max_atoms is not None:
+        atom_exprs = atom_exprs[: max(0, int(max_atoms))]
+    if not atom_exprs:
+        return {}
+    ctx = assertions[0].ctx
+    try:
+        s = z3.Solver(ctx=ctx)
+        s.add(*assertions)
+        _res, imps = s.consequences([], atom_exprs)
+    except z3.Z3Exception:
+        return {}
+    return _consequence_literal_assignment(imps)
+
+
+def merge_root_assignment(
+    root_fixed: Optional[dict] = None,
+    assignment: Optional[dict] = None,
+) -> dict:
+    """合并根级强制赋值与搜索 trail；trail 覆盖同键（与 z3 当前赋值一致）。"""
+    out: dict = dict(root_fixed or {})
+    if assignment:
+        out.update(assignment)
+    return out
 
 
 def _clause_literals(clause):
@@ -586,6 +645,8 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "root_forced_assignment",
+    "merge_root_assignment",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
 ]

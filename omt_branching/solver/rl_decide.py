@@ -27,7 +27,11 @@ from omt_branching.interfaces import NodeType
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.interfaces import Sense
-from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+from omt_branching.solver.propagator_snapshot import (
+    build_bool_snapshot,
+    merge_root_assignment,
+    root_forced_assignment,
+)
 
 from tqdm import tqdm
 
@@ -120,6 +124,8 @@ class SamplingPolicyDecider:
         self._window_phase: bool = True
         self._since = self.refocus_every
         self.steps: list = []
+        # 跨 cut 根级强制赋值（add_hard 后由 consequences 刷新）
+        self._root_fixed: dict[str, bool] = {}
 
     def force_refocus(self) -> None:
         """清空图/分数/粘性窗，使下次 decide 立刻跑 GNN。"""
@@ -135,16 +141,21 @@ class SamplingPolicyDecider:
         self._since = self.refocus_every
 
     def add_hard(self, *exprs) -> None:
-        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
+        """并入硬约束（如 better-cut），刷新根级 forced，并强制下次 decide refocus。
+
+        用 :func:`root_forced_assignment` 在新断言上求根级强制原子，供后续建图投影。
+        """
         if not exprs:
             return
         self.assertions.extend(exprs)
+        self._root_fixed = root_forced_assignment(self.assertions)
         self.force_refocus()
 
     def on_backtrack(self, num_scopes: int = 1) -> None:
         """propagator ``pop`` 回调：冲突回退后强制下次 decide refocus。"""
         if self.refocus_on_backtrack:
             self.force_refocus()
+
     def _undecided_pairs(self, undecided_keys):
         if self._scores is None or self._scores.numel() == 0:
             return [], []
@@ -213,7 +224,8 @@ class SamplingPolicyDecider:
         return key, phase
 
     def _refocus(self, assignment) -> None:
-        snap, _ = build_bool_snapshot(self.assertions, assignment=assignment)
+        asg = merge_root_assignment(self._root_fixed, assignment)
+        snap, _ = build_bool_snapshot(self.assertions, assignment=asg)
         g = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
         g = g.to(self.device)
         out = self.policy.infer(g)

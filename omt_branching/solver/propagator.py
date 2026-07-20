@@ -71,7 +71,7 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         # z3 next_split 的 phase 是 Z3_lbool：真=1，假=-1，未定=0（≠ Python bool）
         z3_phase = z3.Z3_L_TRUE if ph else z3.Z3_L_FALSE
         # self.next_split(atom, 0, z3_phase)
-        self.next_split(atom, 0, z3_UNDEF)
+        self.next_split(atom, 0, z3.Z3_L_UNDEF)
 
 
 __all__ = ["LearnedDecidePropagator"]

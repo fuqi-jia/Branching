@@ -10,6 +10,8 @@ from omt_branching.solver.propagator_snapshot import (
     prepare_propagator_formula,
     build_bool_snapshot,
     clear_bool_snapshot_cache,
+    merge_root_assignment,
+    root_forced_assignment,
 )
 
 
@@ -205,3 +207,32 @@ def test_projected_graph_drops_satisfied_clause_edges():
     assert g0.num_edges(EdgeType.LITERAL_IN_CLAUSE) == 2
     assert g1.num_edges(EdgeType.LITERAL_IN_CLAUSE) == 0
     assert g1.meta["candidate_bool_ids"] == [atom_key(b)]
+
+
+def test_root_forced_assignment_after_cut():
+    """better-cut 风格加强后，consequences 应强制相关比较原子。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    # cut x >= 6 ⇒ a 真、b 假
+    forced = root_forced_assignment(asserts + [x >= 6])
+    assert forced.get(atom_key(a)) is True
+    assert forced.get(atom_key(b)) is False
+
+    snap, _ = build_bool_snapshot(
+        asserts + [x >= 6],
+        assignment=merge_root_assignment(forced, {}),
+    )
+    cand = set(snap.candidate_bool_ids or [])
+    assert atom_key(a) not in cand
+    assert atom_key(b) not in cand
+
+
+def test_merge_root_assignment_trail_overrides():
+    root = {"a": True, "b": False}
+    trail = {"b": True, "c": False}
+    merged = merge_root_assignment(root, trail)
+    assert merged == {"a": True, "b": True, "c": False}
+    assert merge_root_assignment(None, None) == {}
+    assert merge_root_assignment(root, None) == root

@@ -5,6 +5,9 @@
 
 冲突回退时（propagator ``pop`` → :meth:`on_backtrack`）可立即强制下次 decide refocus，
 使优先级与回退后的部分赋值 / 投影图一致。
+
+OMT better-cut 经 :meth:`add_hard` 并入断言后，会刷新根级 ``consequences`` 强制赋值
+（``_root_fixed``），在 refocus 建图时与搜索 trail 合并，跨 cut 投影子句 / 剪候选。
 """
 from __future__ import annotations
 
@@ -18,7 +21,11 @@ from omt_branching.model.policy import BranchingPolicy
 from omt_branching.service import BranchingPolicyService, ServiceConfig
 from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.interfaces import Sense
-from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+from omt_branching.solver.propagator_snapshot import (
+    build_bool_snapshot,
+    merge_root_assignment,
+    root_forced_assignment,
+)
 
 
 class PolicyDecider:
@@ -37,6 +44,8 @@ class PolicyDecider:
         self._pri: Optional[dict] = None
         self._phase: dict = {}
         self._since = self.refocus_every   # 首次即 refocus
+        # 跨 cut 根级强制赋值（add_hard 后由 consequences 刷新）
+        self._root_fixed: dict[str, bool] = {}
 
     def force_refocus(self) -> None:
         """清空缓存优先级，使下次 decide 立刻跑 GNN。"""
@@ -44,10 +53,15 @@ class PolicyDecider:
         self._since = self.refocus_every
 
     def add_hard(self, *exprs) -> None:
-        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
+        """并入硬约束（如 better-cut），刷新根级 forced，并强制下次 decide refocus。
+
+        用 :func:`root_forced_assignment` 在新断言上求根级强制原子，供后续建图投影；
+        不调用 z3 理论引擎以外的预处理，避免改写与 propagator 注册原子不一致。
+        """
         if not exprs:
             return
         self.assertions.extend(exprs)
+        self._root_fixed = root_forced_assignment(self.assertions)
         self.force_refocus()
 
     def on_backtrack(self, num_scopes: int = 1) -> None:
@@ -56,7 +70,8 @@ class PolicyDecider:
             self.force_refocus()
 
     def _refocus(self, assignment):
-        snap, _ = build_bool_snapshot(self.assertions, assignment=assignment)
+        asg = merge_root_assignment(self._root_fixed, assignment)
+        snap, _ = build_bool_snapshot(self.assertions, assignment=asg)
         try:
             advice = self.service.advise(snap)
         except Exception:
