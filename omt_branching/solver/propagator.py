@@ -39,6 +39,10 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
             lim = self._lim.pop()
             while len(self._trail) > lim:
                 self._val.pop(self._trail.pop(), None)
+        # 冲突回退（及任意 scope pop）后通知 decider：下次 decide 立刻 refocus。
+        on_bt = getattr(self.decider, "on_backtrack", None)
+        if callable(on_bt):
+            on_bt(num_scopes)
 
     def fresh(self, new_ctx):
         return LearnedDecidePropagator(new_ctx, self.atoms, self.decider)
@@ -66,7 +70,8 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         self.n_decisions += 1
         # z3 next_split 的 phase 是 Z3_lbool：真=1，假=-1，未定=0（≠ Python bool）
         z3_phase = z3.Z3_L_TRUE if ph else z3.Z3_L_FALSE
-        self.next_split(atom, 0, z3_phase)
+        # self.next_split(atom, 0, z3_phase)
+        self.next_split(atom, 0, z3.Z3_L_UNDEF)
 
 
 __all__ = ["LearnedDecidePropagator"]

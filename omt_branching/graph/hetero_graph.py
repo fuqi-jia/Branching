@@ -74,6 +74,17 @@ class HeteroGraph:
         self.edge_features = {k: v.to(device) for k, v in self.edge_features.items()}
         return self
 
+    def copy_to(self, device: torch.device | str) -> "HeteroGraph":
+        """非原地拷贝到 ``device``（共享 id_maps / meta 引用，供只读推理）。"""
+        return HeteroGraph(
+            node_features={k: v.to(device) for k, v in self.node_features.items()},
+            edge_index={k: v.to(device) for k, v in self.edge_index.items()},
+            edge_features={k: v.to(device) for k, v in self.edge_features.items()},
+            id_maps=self.id_maps,
+            rev_id_maps=self.rev_id_maps,
+            meta=self.meta,
+        )
+
     def finalize(self) -> "HeteroGraph":
         """构图结束后调用：生成反向 id 映射并做一致性校验。"""
         self.rev_id_maps = {

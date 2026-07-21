@@ -186,6 +186,192 @@ def generate_hard_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str 
     return out
 
 
+@dataclass
+class BranchFocusInstance:
+    """分支敏感实例 + 种植的 oracle 优先原子（``str`` 键，与 ``atom_key`` 一致）。"""
+
+    instance: OMTInstance
+    # (atom_key, phase)；先分支这些原子（正确极性）理论上显著缩短搜索
+    oracle_priority: list[tuple[str, bool]] = field(default_factory=list)
+
+
+def generate_branch_focus_lia_instance(
+    instance_id: str,
+    rng: random.Random,
+    *,
+    n_vars: int = 8,
+    n_modes: int = 4,
+    ub: int = 8,
+    chi: int = 4,
+    n_hard_disj: int = 40,
+    k: int = 3,
+    n_distractors: int = 50,
+    sense: Sense = Sense.MAX,
+) -> BranchFocusInstance:
+    """生成**注重分支选择**的有界整数 OMT。
+
+    结构意图（witness 驱动，保证 SAT）：
+
+    1. 用选择变量 ``x0`` 切成 ``n_modes`` 个互斥模式（``Or`` of ``And(lo≤x0≤hi, ...)``）；
+    2. **最优模式**（witness 所在）约束松、目标可达高值；
+    3. **次优模式**附加紧 packing + 大量析取，误入后单次 ``check`` 昂贵且目标被封顶；
+    4. 顶层再挂大量**不含模式守卫**的干扰析取，抬高 VSIDS 对干扰原子的活跃度。
+
+    因此：check-sat-loop 与公平 VSIDS（恒 defer）通常仍走相近搜索（差距小）；
+    若优先分支模式守卫（oracle），可快速锁入最优模式，使 ``check``/加权 rlimit 明显下降。
+    """
+    if n_vars < 3:
+        raise ValueError("branch-focus 需要至少 3 个变量")
+    if n_modes < 2:
+        raise ValueError("branch-focus 需要至少 2 个模式")
+
+    xs = [z3.Int(f"{instance_id}_x{j}") for j in range(n_vars)]
+    names = [f"{instance_id}_x{j}" for j in range(n_vars)]
+    # witness：落在模式 0；其余变量取上半区以抬高目标
+    mode_width = max(1, ub // n_modes)
+    # 模式 i 占用 [i*width, min(ub, (i+1)*width-1)]，最后一模式吃到 ub
+    ranges: list[tuple[int, int]] = []
+    for i in range(n_modes):
+        lo = i * mode_width
+        hi = ub if i == n_modes - 1 else min(ub, (i + 1) * mode_width - 1)
+        if hi < lo:
+            hi = lo
+        ranges.append((lo, hi))
+    w0 = ranges[0][0] + (ranges[0][1] - ranges[0][0]) // 2
+    witness = [w0] + [rng.randint(max(1, ub // 2), ub) for _ in range(n_vars - 1)]
+
+    hard: list = []
+    for x in xs:
+        hard.append(x >= 0)
+        hard.append(x <= ub)
+
+    # 模式守卫原子（供 oracle / 学习优先分支）
+    guard0_lo = xs[0] >= ranges[0][0]
+    guard0_hi = xs[0] <= ranges[0][1]
+    oracle_atoms = [guard0_lo, guard0_hi]
+
+    # 最优模式：松 packing（witness 满足）
+    easy_packing = []
+    for _ in range(2):
+        coeffs = [rng.randint(1, chi) for _ in range(n_vars)]
+        lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
+        v = sum(c * w for c, w in zip(coeffs, witness))
+        easy_packing.append(lhs <= v + rng.randint(2, 5))
+
+    # 次优模式共享的「难」析取池（原子在 witness 上未必为真；每子句保证模式内可 SAT）
+    def _mode_witness(mode_i: int) -> list[int]:
+        lo, hi = ranges[mode_i]
+        mw = [rng.randint(lo, hi)]
+        # 次优模式压低高目标变量
+        for j in range(1, n_vars):
+            mw.append(rng.randint(0, max(1, ub // 3)))
+        return mw
+
+    hard_pool: list = []
+    for _ in range(max(n_hard_disj, n_modes * 4)):
+        coeffs = [rng.randint(0, chi) for _ in range(n_vars)]
+        if all(c == 0 for c in coeffs):
+            coeffs[rng.randrange(n_vars)] = 1
+        lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
+        mw = _mode_witness(rng.randint(1, n_modes - 1))
+        v = sum(c * w for c, w in zip(coeffs, mw))
+        hard_pool.append(lhs <= v + rng.randint(0, 2))
+
+    mode_branches: list = []
+    for i, (lo, hi) in enumerate(ranges):
+        parts = [xs[0] >= lo, xs[0] <= hi]
+        if i == 0:
+            parts.extend(easy_packing)
+        else:
+            mw = _mode_witness(i)
+            for j in range(1, min(n_vars, 4)):
+                parts.append(xs[j] <= max(1, ub // 3))
+            coeffs = [rng.randint(1, chi) for _ in range(n_vars)]
+            lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
+            v = sum(c * w for c, w in zip(coeffs, mw))
+            parts.append(lhs <= v + 1)
+            for _ in range(max(3, n_hard_disj // n_modes)):
+                chosen = rng.sample(hard_pool, min(k, len(hard_pool)))
+                c2 = [rng.randint(1, chi) for _ in range(n_vars)]
+                lhs2 = z3.Sum([c * x for c, x in zip(c2, xs)])
+                v2 = sum(c * w for c, w in zip(c2, mw))
+                rescue = lhs2 <= v2 + 1
+                parts.append(z3.Or(*(list(chosen) + [rescue])))
+        mode_branches.append(z3.And(*parts))
+
+    hard.append(z3.Or(*mode_branches))
+
+    # 干扰析取：共享原子池，**刻意不含** x0 模式守卫，吸引 VSIDS
+    distractor_pool: list[tuple] = []
+    body = list(range(1, n_vars))
+    for _ in range(max(8, n_distractors)):
+        use = body if len(body) >= 2 else list(range(n_vars))
+        idxs = rng.sample(use, min(k, len(use)))
+        coeffs = [0] * n_vars
+        for j in idxs:
+            coeffs[j] = rng.randint(1, chi)
+        terms = [coeffs[j] * xs[j] for j in idxs]
+        lhs = z3.Sum(terms) if len(terms) > 1 else terms[0]
+        v_w = sum(coeffs[j] * witness[j] for j in idxs)
+        slack = rng.randint(-2, 3)
+        atom = lhs <= v_w + slack
+        holds = v_w <= v_w + slack  # 恒 True 当 slack>=0；slack<0 时可能 False
+        distractor_pool.append((atom, holds))
+
+    true_d = [a for a, h in distractor_pool if h] or [xs[1] <= ub]
+    for _ in range(n_distractors):
+        chosen = rng.sample(distractor_pool, min(k, len(distractor_pool)))
+        lits = [a for a, _ in chosen]
+        if not any(h for _, h in chosen):
+            lits[0] = rng.choice(true_d)
+        hard.append(z3.Or(*lits))
+
+    # 目标：后半变量高系数（最优模式可达；次优模式被上界压制）
+    obj_c = [1] + [rng.randint(3, 8) for _ in range(n_vars - 1)]
+    objective = z3.Sum([c * x for c, x in zip(obj_c, xs)])
+
+    from omt_branching.solver.propagator_snapshot import atom_key
+
+    oracle_priority = [(atom_key(a), True) for a in oracle_atoms]
+    inst = OMTInstance(
+        instance_id=instance_id,
+        variables=xs,
+        hard=hard,
+        objective=objective,
+        sense=sense,
+        obj_coeffs={n: float(c) for n, c in zip(names, obj_c)},
+        theory="LIA",
+        family="branch_focus",
+        description=(
+            f"branch-focus LIA, {n_vars} vars {n_modes} modes, "
+            f"hard_disj~{n_hard_disj}, distractors={n_distractors}"
+        ),
+    )
+    return BranchFocusInstance(instance=inst, oracle_priority=oracle_priority)
+
+
+def generate_branch_focus_lia_dataset(
+    count: int,
+    seed: int = 0,
+    *,
+    id_prefix: str = "bfocus",
+    min_vars: int = 7,
+    max_vars: int = 9,
+    **kwargs,
+) -> list[BranchFocusInstance]:
+    """生成 ``count`` 个分支敏感 LIA 实例（含 oracle 优先序）。"""
+    rng = random.Random(seed)
+    out: list[BranchFocusInstance] = []
+    for i in range(count):
+        n_vars = rng.randint(min_vars, max_vars)
+        out.append(
+            generate_branch_focus_lia_instance(
+                f"{id_prefix}{i}", rng, n_vars=n_vars, **kwargs
+            )
+        )
+    return out
+
+
 def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
                                n_vars: int = 6, n_constraints: int = 4, ub: int = 8,
                                coeff_lo: int = 1, coeff_hi: int = 5, slack: int = 1,
@@ -538,6 +724,7 @@ def _main() -> None:
 
 __all__ = [
     "OMTInstance",
+    "BranchFocusInstance",
     "generate_instance",
     "generate_dataset",
     "generate_hard_lia_instance",
@@ -546,6 +733,8 @@ __all__ = [
     "generate_bool_lia_dataset",
     "bool_lia_instance_at",
     "generate_hard_bool_lia_dataset",
+    "generate_branch_focus_lia_instance",
+    "generate_branch_focus_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
     "LRA_FAMILIES",

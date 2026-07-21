@@ -1,7 +1,7 @@
 """拼合多个数据集，供跨规模/跨分布泛化研究。
 
 从若干源数据集中按指定数量随机抽取 train/test 实例，复制 ``.smt2``，并在有缓存时
-一并复制 ``binary/`` 与 ``lookahead/``，写入默认目录 ``examples/artifacts/dataset``，
+一并复制 ``ref/`` 与 ``lookahead/``，写入默认目录 ``examples/artifacts/dataset``，
 生成新的 ``manifest.json``。
 
 实例 id 默认：``v{n_vars}__{原id}``，其中 ``n_vars`` **以源数据集 manifest 条目为准**
@@ -357,7 +357,7 @@ def mix_datasets(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="拼合多数据集（smt2 + binary/lookahead 缓存）到默认 dataset 目录"
+        description="拼合多数据集（smt2 + ref/lookahead 缓存）到默认 dataset 目录"
     )
     ap.add_argument(
         "--source",
@@ -402,14 +402,14 @@ def main() -> None:
     print(
         f"train={manifest['params']['train']}  test={manifest['params']['test']}  "
         f"id_scheme={manifest['params']['id_scheme']}  "
-        f"smt2={stats.get('smt2')}  binary={stats.get('binary')} "
+        f"smt2={stats.get('smt2')}  ref={stats.get('binary')} "
         f"(缺 {stats.get('binary_missing')})  "
         f"lookahead={stats.get('lookahead')} (缺 {stats.get('lookahead_missing')})"
     )
     print(f"manifest -> {Path(args.out_dir) / 'manifest.json'}")
     if stats.get("binary_missing"):
         print(
-            "提示: 部分实例无 binary 缓存，评测/RL 前请运行:\n"
+            "提示: 部分实例无 ref 缓存，评测/RL 前请运行:\n"
             f"  python -m examples.solve_dataset_binary --dataset-dir {args.out_dir}"
         )
 

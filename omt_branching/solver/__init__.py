@@ -29,7 +29,9 @@ from omt_branching.solver.rl import (
     solve_and_measure,
 )
 from omt_branching.solver.instance_gen import (
-    LRA_FAMILIES, OMTInstance, generate_bool_lia_dataset, generate_bool_lia_instance, generate_hard_bool_lia_dataset,
+    LRA_FAMILIES, OMTInstance, BranchFocusInstance,
+    generate_bool_lia_dataset, generate_bool_lia_instance, generate_hard_bool_lia_dataset,
+    generate_branch_focus_lia_dataset, generate_branch_focus_lia_instance,
     generate_dataset, generate_hard_lia_dataset, generate_hard_lia_instance,
     generate_instance, generate_lra_dataset, generate_lra_instance, oracle_numeric_choice,
 )
@@ -43,8 +45,10 @@ from omt_branching.solver.propagator_snapshot import (
     clear_bool_snapshot_cache,
     collect_atoms,
     collect_clause_atoms,
+    merge_root_assignment,
     prepare_propagator_formula,
     preprocess_assertions,
+    root_forced_assignment,
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learned_policy
@@ -55,8 +59,18 @@ from omt_branching.solver.decide_omt import (
     save_dataset, list_split_entries,
 )
 from omt_branching.solver.binary_results import (
-    binary_rlimit, binary_value, has_binary_result, load_binary_result,
-    load_binary_results, missing_binary_ids, save_binary_result,
+    REF_SUBDIR,
+    binary_rlimit,
+    binary_value,
+    build_ref_payload,
+    check_sat_loop_stats_from_ref,
+    has_binary_result,
+    is_fair_vsids_cache,
+    load_binary_result,
+    load_binary_results,
+    missing_binary_ids,
+    save_binary_result,
+    vsids_stats_from_ref,
 )
 from omt_branching.solver.lookahead_cache import (
     has_lookahead_result, load_lookahead_result, save_lookahead_result,
@@ -115,6 +129,9 @@ __all__ = [
     "generate_bool_lia_instance",
     "generate_bool_lia_dataset",
     "generate_hard_bool_lia_dataset",
+    "BranchFocusInstance",
+    "generate_branch_focus_lia_instance",
+    "generate_branch_focus_lia_dataset",
     "LRA_FAMILIES",
     "oracle_numeric_choice",
     # 训练数据
@@ -135,6 +152,8 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "root_forced_assignment",
+    "merge_root_assignment",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
     "LearnedDecidePropagator",
@@ -151,13 +170,18 @@ __all__ = [
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",
+    "REF_SUBDIR",
     "binary_rlimit",
     "binary_value",
+    "build_ref_payload",
+    "check_sat_loop_stats_from_ref",
     "has_binary_result",
+    "is_fair_vsids_cache",
     "load_binary_result",
     "load_binary_results",
     "missing_binary_ids",
     "save_binary_result",
+    "vsids_stats_from_ref",
     "has_lookahead_result",
     "load_lookahead_result",
     "save_lookahead_result",

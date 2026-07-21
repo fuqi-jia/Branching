@@ -14,7 +14,9 @@ def test_sampling_decider_records_steps_and_valid_choice():
     asserts = [x >= 0, x <= 10, z3.Or(a, b)]
     policy = BranchingPolicy()
     defer = torch.zeros(())
-    dec = SamplingPolicyDecider(policy, defer, asserts, refocus_every=100, sample=True)
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=100, sample=True, sticky_window=True
+    )
     und = [atom_key(a), atom_key(b)]
     torch.manual_seed(0)
     outs = [dec(und, {}) for _ in range(5)]
@@ -44,6 +46,27 @@ def test_sampling_decider_sticky_reuses_scores_without_resample():
     assert len(dec.steps) == 1
     assert o1 is not None and o1[0] in und
     assert o2 == o1 and o3 == o1
+
+
+def test_sampling_decider_backtrack_forces_new_window():
+    """on_backtrack 清空粘性窗，下次 decide 重新 refocus 并记新 step。"""
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    policy = BranchingPolicy()
+    defer = torch.tensor(-10.0)
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=100, sample=True, sticky_window=True
+    )
+    und = [atom_key(a), atom_key(b)]
+    torch.manual_seed(2)
+    _ = dec(und, {})
+    assert len(dec.steps) == 1
+    dec.on_backtrack(1)
+    assert dec._since == dec.refocus_every
+    assert dec._graph is None
+    _ = dec(und, {})
+    assert len(dec.steps) == 2
 
 
 def test_sampling_decider_nonsticky_records_every_call():
@@ -154,14 +177,19 @@ def test_train_sat_normalized_reward_history():
 
 
 def test_decide_rl_parallel_collect():
-    """多进程 collect + 主进程 update。"""
+    """多进程 collect + GpuInferService 排队推理 + 主进程 update。"""
     from omt_branching.solver import generate_bool_lia_dataset
     from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
 
     insts = generate_bool_lia_dataset(8, seed=2, min_vars=5, max_vars=5)
     tr = DecideRLTrainer(
         BranchingPolicy(),
-        DecideRLConfig(refocus_every=40, workers=2, min_instances_for_parallel=4),
+        DecideRLConfig(
+            refocus_every=40,
+            workers=2,
+            min_instances_for_parallel=4,
+            use_all_gpus=False,
+        ),
     )
     hist = tr.train(
         [i.as_tuple() for i in insts],
@@ -171,5 +199,113 @@ def test_decide_rl_parallel_collect():
         collect_min_vars=5,
         collect_max_vars=5,
     )
-    assert len(hist) == 8
-    assert all(h["steps"] >= 0 for h in hist)
+    # train_end 汇总一条
+    assert len(hist) == 9
+    assert all(h.get("steps", 0) >= 0 for h in hist if "steps" in h)
+
+
+def test_decide_rl_collect_batch_size():
+    """每轮只 collect 指定 batch，history 步数 = batch（另加 train_end）。"""
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    insts = generate_bool_lia_dataset(8, seed=4, min_vars=5, max_vars=5)
+    tr = DecideRLTrainer(
+        BranchingPolicy(),
+        DecideRLConfig(
+            refocus_every=40,
+            workers=1,
+            collect_batch_size=3,
+            sticky_window=False,
+        ),
+    )
+    hist = tr.train(
+        [i.as_tuple() for i in insts],
+        iterations=2,
+        workers=1,
+        collect_seed=4,
+        collect_min_vars=5,
+        collect_max_vars=5,
+        collect_batch_size=3,
+    )
+    steps = [h for h in hist if "steps" in h and "event" not in h]
+    assert len(steps) == 6  # 2 iters × 3
+    end = hist[-1]
+    assert end.get("event") == "train_end"
+    assert end.get("collect_batch_size") == 3
+    assert end.get("sticky_window") is False
+
+
+def test_gpu_infer_pool_queues_slots():
+    """空闲槽排队：单设备上两次 infer 均可完成。"""
+    from omt_branching.solver.rl_decide import GpuInferPool
+    from omt_branching.input.graph_builder import GraphBuilder
+    from omt_branching.input.solver_state import (
+        BooleanVarInfo,
+        ClauseInfo,
+        ObjectiveInfo,
+        SearchStateInfo,
+        SolverSnapshot,
+    )
+
+    policy = BranchingPolicy()
+    pool = GpuInferPool.from_policy(policy, device="cpu", use_all_gpus=False)
+    snap = SolverSnapshot(
+        bool_vars=[
+            BooleanVarInfo(var_id="a", is_candidate=True),
+            BooleanVarInfo(var_id="b", is_candidate=True),
+        ],
+        clauses=[ClauseInfo(clause_id="c0", literals=[("a", True), ("b", False)])],
+        objective=ObjectiveInfo(objective_id="obj"),
+        search_state=SearchStateInfo(),
+        candidate_bool_ids=["a", "b"],
+    )
+    g = GraphBuilder().build(snap)
+    s1, p1 = pool.infer(g)
+    s2, p2 = pool.infer(g)
+    assert s1.shape == s2.shape == (2,)
+    assert p1.shape == p2.shape == (2,)
+
+
+def test_gpu_infer_service_remote_client():
+    """主进程 GpuInferService + RemoteInferClient（Queue + Pipe）。"""
+    import multiprocessing as mp
+
+    from omt_branching.input.graph_builder import GraphBuilder
+    from omt_branching.input.solver_state import (
+        BooleanVarInfo,
+        ClauseInfo,
+        ObjectiveInfo,
+        SearchStateInfo,
+        SolverSnapshot,
+    )
+    from omt_branching.solver.rl_decide import GpuInferService, RemoteInferClient
+
+    ctx = mp.get_context("spawn")
+    req = ctx.Queue()
+    policy = BranchingPolicy()
+    svc = GpuInferService.from_policy(
+        policy, req, device="cpu", use_all_gpus=False
+    )
+    svc.start()
+    try:
+        client = RemoteInferClient(req, ctx)
+        snap = SolverSnapshot(
+            bool_vars=[
+                BooleanVarInfo(var_id="a", is_candidate=True),
+                BooleanVarInfo(var_id="b", is_candidate=True),
+            ],
+            clauses=[
+                ClauseInfo(clause_id="c0", literals=[("a", True), ("b", False)])
+            ],
+            objective=ObjectiveInfo(objective_id="obj"),
+            search_state=SearchStateInfo(),
+            candidate_bool_ids=["a", "b"],
+        )
+        g = GraphBuilder().build(snap)
+        s, p = client.infer(g)
+        assert s.shape == (2,)
+        assert p.shape == (2,)
+    finally:
+        svc.stop()
+

@@ -32,3 +32,29 @@ def test_none_decider_falls_back():
     resN, nN = _solve(lambda und, asg: None)   # 永远 None = 退回 VSIDS
     assert resN == z3.sat
     assert nN == 0                        # 我们没强制任何决策
+
+
+def test_pop_notifies_decider_on_backtrack():
+    """propagator.pop 会调用 decider.on_backtrack(num_scopes)。"""
+    xs, clauses = _sat_instance()
+    events = []
+
+    class _Dec:
+        def on_backtrack(self, num_scopes=1):
+            events.append(num_scopes)
+
+        def __call__(self, undecided, assignment):
+            return None
+
+    s = z3.Solver()
+    p = LearnedDecidePropagator(s, xs, _Dec())
+    s.add(*clauses)
+    p.push()
+    p.push()
+    # 模拟注册原子被 fixed，再 pop 两层
+    k0 = atom_key(xs[0])
+    p._val[k0] = True
+    p._trail.append(k0)
+    p.pop(2)
+    assert events == [2]
+    assert k0 not in p._val

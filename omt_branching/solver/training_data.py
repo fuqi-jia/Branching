@@ -229,8 +229,12 @@ def _compute_and_maybe_cache_lookahead(
     dataset_dir: str | None = None,
     split: str | None = None,
     use_cache: bool = True,
+    cache_only: bool = False,
 ) -> RankingExample | None:
-    """算 look-ahead；有 dataset_dir/split 时读/写持久化缓存。"""
+    """算 look-ahead；有 dataset_dir/split 时读/写持久化缓存。
+
+    ``cache_only=True`` 时只读缓存，缺失则返回 ``None``（不现算）。
+    """
     from omt_branching.solver.lookahead import lookahead_scores
     from omt_branching.solver.lookahead_cache import (
         load_lookahead_result,
@@ -251,6 +255,8 @@ def _compute_and_maybe_cache_lookahead(
         return _build_lookahead_one(
             inst, cfg, scores_phases=(cached["scores"], cached["phases"])
         )
+    if cache_only:
+        return None
 
     hard = list(inst.hard)
     snap, amap = build_bool_snapshot(hard)
@@ -292,6 +298,7 @@ def _lookahead_from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None
         dataset_dir,
         split,
         use_cache,
+        cache_only,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
     from omt_branching.solver.lookahead import LookaheadConfig
@@ -304,6 +311,7 @@ def _lookahead_from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None
         dataset_dir=dataset_dir,
         split=split,
         use_cache=use_cache,
+        cache_only=cache_only,
     )
 
 
@@ -379,11 +387,12 @@ def build_lookahead_examples_from_smt2_parallel(
     dataset_dir: str | None = None,
     split: str | None = None,
     use_cache: bool = True,
+    cache_only: bool = False,
 ) -> list[RankingExample]:
     """从已落盘 ``.smt2`` 并行构造 look-ahead 样本（不重新生成实例）。
 
     ``dataset_dir`` + ``split`` 非空且 ``use_cache`` 时：优先读
-    ``lookahead/<split>/<id>.json``；缺失则计算后即时写入。
+    ``lookahead/<split>/<id>.json``；缺失则计算后即时写入（``cache_only`` 时跳过）。
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -407,6 +416,7 @@ def build_lookahead_examples_from_smt2_parallel(
                 dataset_dir=dataset_dir,
                 split=split,
                 use_cache=use_cache,
+                cache_only=cache_only,
             )
             if ex is not None:
                 out.append(ex)
@@ -425,6 +435,7 @@ def build_lookahead_examples_from_smt2_parallel(
             dataset_dir,
             split,
             use_cache,
+            cache_only,
         )
         for i in range(n)
     ]

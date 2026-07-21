@@ -7,6 +7,13 @@
 - :func:`collect_clause_atoms` —— 仅 CNF 析取子句（|lits|≥2）中的原子（``prop.add``）；
 - :func:`preprocess_assertions` / :func:`prepare_propagator_formula` —— 挂 prop 前轻量预处理。
 
+建图动态投影（``assignment`` / ``fixed``）：
+- :func:`build_bool_snapshot` 在非空赋值下做布尔单元传播闭包，再投影子句边、
+  剪掉已定候选，供 GNN 在当前部分赋值下重建图（不调用 z3 理论引擎）。
+- :func:`root_forced_assignment` —— OMT better-cut 后在根状态用 ``consequences``
+  求硬断言强制的原子赋值；经 :func:`merge_root_assignment` 并入搜索 trail，
+  供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。
+
 性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
 from __future__ import annotations
@@ -211,6 +218,62 @@ def prepare_propagator_formula(assertions) -> tuple[list, list]:
     """
     pp = preprocess_assertions(assertions)
     return pp, collect_clause_atoms(pp)
+
+
+def _consequence_literal_assignment(imps) -> dict[str, bool]:
+    """从 ``consequences`` 的 implication 列表得到 ``原子键 -> 强制真值``。"""
+    out: dict[str, bool] = {}
+    for imp in imps:
+        cons = imp.arg(1) if (z3.is_implies(imp) and imp.num_args() == 2) else imp
+        pos = True
+        e = cons
+        while z3.is_not(e):
+            pos = not pos
+            e = e.arg(0)
+        if _is_atom(e):
+            out[atom_key(e)] = pos
+    return out
+
+
+def root_forced_assignment(
+    assertions,
+    atoms=None,
+    *,
+    max_atoms: Optional[int] = None,
+) -> dict[str, bool]:
+    """根状态（无决策假设）下，用 z3 ``consequences`` 求被硬断言强制的原子赋值。
+
+    典型用途：OMT 线性搜索每次 better-cut 并入断言后，刷新根级 forced 集合，
+    再经 :func:`merge_root_assignment` 喂给 :func:`build_bool_snapshot`，投影子句并
+    剪掉已定候选。失败或无原子时返回空 dict（不影响后续求解）。
+    """
+    assertions = list(assertions)
+    if not assertions:
+        return {}
+    atom_exprs = list(atoms) if atoms is not None else collect_atoms(assertions)
+    if max_atoms is not None:
+        atom_exprs = atom_exprs[: max(0, int(max_atoms))]
+    if not atom_exprs:
+        return {}
+    ctx = assertions[0].ctx
+    try:
+        s = z3.Solver(ctx=ctx)
+        s.add(*assertions)
+        _res, imps = s.consequences([], atom_exprs)
+    except z3.Z3Exception:
+        return {}
+    return _consequence_literal_assignment(imps)
+
+
+def merge_root_assignment(
+    root_fixed: Optional[dict] = None,
+    assignment: Optional[dict] = None,
+) -> dict:
+    """合并根级强制赋值与搜索 trail；trail 覆盖同键（与 z3 当前赋值一致）。"""
+    out: dict = dict(root_fixed or {})
+    if assignment:
+        out.update(assignment)
+    return out
 
 
 def _clause_literals(clause):
@@ -422,40 +485,154 @@ def _get_static(assertions) -> _StaticBoolSnapshot:
     return static
 
 
+def _lit_truth(assignment: dict, key: str, pos: bool) -> Optional[bool]:
+    """文字 ``(key, pos)`` 在赋值下：True=已满足，False=已假，None=未定。"""
+    if key not in assignment:
+        return None
+    val = bool(assignment[key])
+    return val if pos else (not val)
+
+
+def _boolean_bcp(clauses: list[ClauseInfo], assignment: dict) -> dict:
+    """在子句骨架上对 ``assignment`` 做布尔单元传播闭包（不改动入参、不调 z3）。"""
+    asg = dict(assignment)
+    changed = True
+    while changed:
+        changed = False
+        for c in clauses:
+            undecided: list[tuple[str, bool]] = []
+            sat = False
+            for k, p in c.literals:
+                t = _lit_truth(asg, k, p)
+                if t is True:
+                    sat = True
+                    break
+                if t is None:
+                    undecided.append((k, p))
+            if sat or len(undecided) != 1:
+                continue
+            k, p = undecided[0]
+            forced = bool(p)
+            if k not in asg:
+                asg[k] = forced
+                changed = True
+    return asg
+
+
+def _project_clauses(clauses: list[ClauseInfo], assignment: dict) -> list[ClauseInfo]:
+    """按赋值投影子句：已满足者清空边；未满足者去掉假文字；全假标冲突。"""
+    out: list[ClauseInfo] = []
+    for c in clauses:
+        sat = False
+        remaining: list[tuple] = []
+        for k, p in c.literals:
+            t = _lit_truth(assignment, k, p)
+            if t is True:
+                sat = True
+                break
+            if t is None:
+                remaining.append((k, p))
+        if sat:
+            out.append(ClauseInfo(
+                clause_id=c.clause_id,
+                literals=[],
+                kind=c.kind,
+                lbd=c.lbd,
+                activity=c.activity,
+                is_satisfied=True,
+            ))
+        else:
+            out.append(ClauseInfo(
+                clause_id=c.clause_id,
+                literals=remaining,
+                kind=c.kind,
+                lbd=c.lbd,
+                activity=c.activity,
+                is_satisfied=False if not remaining else None,
+            ))
+    return out
+
+
+def _occ_from_clauses(clauses: list[ClauseInfo], atom_keys: list[str]):
+    """从投影后的活跃子句重算出现统计（已满足子句不计）。"""
+    occ = {k: 0 for k in atom_keys}
+    pos = {k: 0 for k in atom_keys}
+    neg = {k: 0 for k in atom_keys}
+    for c in clauses:
+        if c.is_satisfied:
+            continue
+        for k, p in c.literals:
+            if k not in occ:
+                continue
+            occ[k] += 1
+            if p:
+                pos[k] += 1
+            else:
+                neg[k] += 1
+    return occ, pos, neg
+
+
 def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
                         stats: Optional[dict] = None, snapshot_id: str = "prop"):
     """构造 SolverSnapshot。
 
-    静态部分（原子/子句/理论特征）按 ``assertions`` 缓存；每次调用只根据
-    ``assignment`` / ``stats`` 填充动态字段。
+    静态部分（原子/子句/理论特征）按 ``assertions`` 缓存。
+    ``assignment`` 非空时：布尔 BCP 闭包 → 投影子句边 → 剪掉已定候选，重建动态图视图；
+    空赋值时直接复用静态子句对象（零拷贝）。
     """
     assignment = assignment or {}
     stats = stats or {}
     static = _get_static(list(assertions))
 
-    bool_vars = [
-        BooleanVarInfo(
-            var_id=k,
-            assignment=assignment.get(k),
-            is_candidate=True,
-            occurrence_count=static.occ[k],
-            pos_count=static.pos[k],
-            neg_count=static.neg[k],
-        )
-        for k in static.atom_keys
-    ]
+    if not assignment:
+        bool_vars = [
+            BooleanVarInfo(
+                var_id=k,
+                assignment=None,
+                is_candidate=True,
+                occurrence_count=static.occ[k],
+                pos_count=static.pos[k],
+                neg_count=static.neg[k],
+            )
+            for k in static.atom_keys
+        ]
+        clauses = static.clauses
+        candidates = list(static.atom_keys)
+        trail_len = 0
+    else:
+        asg = _boolean_bcp(static.clauses, assignment)
+        clauses = _project_clauses(static.clauses, asg)
+        occ, pos, neg = _occ_from_clauses(clauses, static.atom_keys)
+        bool_vars = []
+        candidates = []
+        for k in static.atom_keys:
+            val = asg.get(k)
+            fixed = val is not None
+            bool_vars.append(BooleanVarInfo(
+                var_id=k,
+                assignment=val,
+                is_candidate=not fixed,
+                is_eliminated=False,
+                occurrence_count=occ[k],
+                pos_count=pos[k],
+                neg_count=neg[k],
+            ))
+            if not fixed:
+                candidates.append(k)
+        trail_len = len(asg)
+
     search_state = SearchStateInfo(
         decision_level=int(stats.get("decisions", 0)),
         conflict_count=int(stats.get("conflicts", 0)),
-        trail_length=len(assignment),
+        trail_length=trail_len,
     )
     snap = SolverSnapshot(
         bool_vars=bool_vars,
-        clauses=static.clauses,
+        clauses=clauses,
         theory_atoms=static.theory_atoms,
         numeric_vars=static.numeric_vars,
         search_state=search_state,
-        candidate_bool_ids=list(static.atom_keys),
+        candidate_bool_ids=candidates,
         candidate_numeric_ids=[],
         snapshot_id=snapshot_id,
     )
@@ -468,6 +645,8 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "root_forced_assignment",
+    "merge_root_assignment",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
 ]

@@ -1,0 +1,229 @@
+"""加载已有策略权重，在数据集 test 划分上做四臂对比并写 ``results.json``。
+
+评测逻辑与 ``examples/decide_branch.py`` 一致（``SamplingPolicyDecider`` +
+``sample=False`` 允许 defer；ref 缓存参考），不训练。默认权重
+``examples/artifacts/rl_decide_policy.pt``，默认数据 ``examples/artifacts/dataset``。
+
+运行::
+
+    python -m examples.eval_checkpoint
+    python -m examples.eval_checkpoint --checkpoint examples/artifacts/rl_checkpoints/iter_0005.pt
+    python -m examples.eval_checkpoint --dataset-dir path/to/dataset --out path/to/results.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+from pathlib import Path
+
+from omt_branching.model.device import gnn_device
+from omt_branching.model.persistence import load_policy
+from omt_branching.solver import list_split_entries, load_dataset
+
+from examples.decide_branch import (
+    ARTIFACTS,
+    DEFAULT_DATASET_DIR,
+    DEFAULT_TEST_WORKERS,
+    _json_value,
+    _require_binary_cache,
+    _require_dataset,
+    _run_test_parallel,
+    _stats_for_json,
+    _sync_manifest_if_needed,
+)
+
+DEFAULT_CKPT = os.path.join(ARTIFACTS, "rl_decide_policy.pt")
+DEFAULT_OUT = os.path.join(ARTIFACTS, "results.json")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="加载 checkpoint，在 dataset test 上四臂对比并写 results.json"
+    )
+    ap.add_argument(
+        "--checkpoint",
+        "--ckpt",
+        dest="checkpoint",
+        default=DEFAULT_CKPT,
+        help=f"策略权重 .pt（默认 {DEFAULT_CKPT}）",
+    )
+    ap.add_argument(
+        "--dataset-dir",
+        default=DEFAULT_DATASET_DIR,
+        help=f"数据集目录（默认 {DEFAULT_DATASET_DIR}）",
+    )
+    ap.add_argument(
+        "--out",
+        default=DEFAULT_OUT,
+        help=f"结果 JSON 路径（默认 {DEFAULT_OUT}）",
+    )
+    ap.add_argument("--refocus", type=int, default=50)
+    ap.add_argument(
+        "--test-workers",
+        type=int,
+        default=DEFAULT_TEST_WORKERS,
+        help=f"测试并发数（默认 {DEFAULT_TEST_WORKERS}）",
+    )
+    ap.add_argument("--z3-path", default=None, help="z3 可执行文件路径（默认同 PATH）")
+    ap.add_argument(
+        "--device",
+        default=None,
+        help="GNN 设备（默认 cuda 可用则 cuda，否则 cpu）",
+    )
+    ap.add_argument(
+        "--sticky-window",
+        action="store_true",
+        help="启用窗口粘性（默认关闭，与 decide_branch 训练默认一致）",
+    )
+    ap.add_argument(
+        "--defer-logit",
+        type=float,
+        default=None,
+        help="覆盖 checkpoint meta 中的 defer_logit（默认读 meta，否则 0）",
+    )
+    args = ap.parse_args()
+
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.is_file():
+        raise SystemExit(f"权重不存在: {ckpt_path}")
+
+    dataset_dir = args.dataset_dir
+    device = args.device or gnn_device()
+    print(f"GNN device: {device}")
+    print(f"checkpoint: {ckpt_path.resolve()}")
+    print(f"数据集目录: {dataset_dir}")
+
+    z3_path = args.z3_path or shutil.which("z3")
+    if not z3_path:
+        raise SystemExit("未找到 z3 二进制，请用 --z3-path 指定")
+
+    _require_dataset(dataset_dir)
+    _sync_manifest_if_needed(dataset_dir)
+
+    test_entries = list_split_entries(dataset_dir, "test")
+    if not test_entries:
+        raise SystemExit(f"数据集无 test 划分: {dataset_dir}")
+    insts = load_dataset(dataset_dir, split="test")
+    print(f"测试集 {len(insts)} 个实例已从磁盘加载")
+    _require_binary_cache(dataset_dir, "test", test_entries)
+
+    policy, meta = load_policy(ckpt_path, map_location="cpu")
+    policy.to(device)
+    policy.eval()
+    if args.defer_logit is not None:
+        defer_logit = float(args.defer_logit)
+    else:
+        defer_logit = float(meta.get("defer_logit", 0.0)) if meta else 0.0
+    sticky_window = bool(args.sticky_window)
+    if meta:
+        print(
+            f"已加载权重 meta keys={list(meta.keys())}, "
+            f"defer_logit={defer_logit}, sticky_window={sticky_window}"
+        )
+
+    _solver_arm = {
+        "rlimit": 0.0,
+        "decider factory rlimit": 0.0,
+        "model base rlimit": 0.0,
+        "model cut rlimit": 0.0,
+        "check rlimit": 0.0,
+        "eval rlimit": 0.0,
+        "weighted rlimit": 0.0,
+        "conflicts": 0.0,
+        "decisions": 0.0,
+        "match": 0.0,
+    }
+    agg = {
+        "binary": {
+            "rlimit": 0.0,
+            "time_ms": 0.0,
+            "conflicts": 0.0,
+        },
+        "check_sat_loop": dict(_solver_arm),
+        "vsids": dict(_solver_arm),
+        "learned": dict(_solver_arm),
+    }
+    per_instance: list[dict] = []
+    rows = _run_test_parallel(
+        test_entries,
+        dataset_dir,
+        policy,
+        device,
+        args.refocus,
+        args.test_workers,
+        defer_logit=defer_logit,
+        sticky_window=sticky_window,
+    )
+    for row in rows:
+        ref_val = row["ref_val"]
+        ref = row["binary"]
+        csl = row.get("check_sat_loop") or {}
+        v = row["vsids"]
+        ln = row["learned"]
+        for key in agg["binary"].keys():
+            agg["binary"][key] += ref.get(key) or 0
+        for arm_key, arm_stats in (
+            ("check_sat_loop", csl),
+            ("vsids", v),
+            ("learned", ln),
+        ):
+            for key in arm_stats.keys():
+                if key not in agg[arm_key]:
+                    continue
+                val = arm_stats[key]
+                agg[arm_key][key] += 0 if val is None else val
+            agg[arm_key]["match"] += (
+                1.0 if arm_stats.get("value") == ref_val else 0.0
+            )
+        per_instance.append({
+            "instance_id": row["instance_id"],
+            "binary": _stats_for_json(ref),
+            "check_sat_loop": _stats_for_json(csl),
+            "vsids": _stats_for_json(v),
+            "learned": _stats_for_json(ln),
+        })
+
+    n = max(1, len(insts))
+    print(
+        f"=== 四臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
+        f"match=1 为与该最优值一致）==="
+    )
+    for arm in agg:
+        for key in agg[arm]:
+            agg[arm][key] /= n
+
+    print(f"summary.binary  = { {k: round(v, 4) if isinstance(v, float) else v for k, v in agg['binary'].items()} }")
+    print(f"summary.check_sat_loop match={agg['check_sat_loop']['match']:.3f}  "
+          f"weighted_rlimit={agg['check_sat_loop'].get('weighted rlimit', 0):.1f}")
+    print(f"summary.vsids   match={agg['vsids']['match']:.3f}  "
+          f"weighted_rlimit={agg['vsids'].get('weighted rlimit', 0):.1f}")
+    print(f"summary.learned match={agg['learned']['match']:.3f}  "
+          f"weighted_rlimit={agg['learned'].get('weighted rlimit', 0):.1f}")
+
+    results = {
+        "reference": "ref_cache",
+        "dataset_dir": dataset_dir,
+        "summary": agg,
+        "n_instances": len(insts),
+        "z3_path": z3_path,
+        "device": device,
+        "test_workers": args.test_workers,
+        "per_instance": per_instance,
+        "defer_logit": defer_logit,
+        "sticky_window": sticky_window,
+        # 评测专用溯源（decide_branch 无此字段）
+        "checkpoint": str(ckpt_path.resolve()),
+        "checkpoint_meta": {k: _json_value(v) for k, v in meta.items()},
+    }
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+    print(f"实验汇总已保存 -> {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
