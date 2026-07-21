@@ -140,6 +140,76 @@ def _require_binary_cache(dataset_dir: str, split: str, entries: list[dict]) -> 
         )
 
 
+def _require_imitation_lookahead_cache(
+    dataset_dir: str,
+    split: str,
+    entries: list[dict],
+    *,
+    kind: str,
+) -> None:
+    """imitation 默认只读已有 look-ahead 缓存；缺失则提示先跑构建脚本。"""
+    if kind == "objective":
+        from examples.build_objective_lookahead import (
+            has_objective_lookahead_result,
+            load_objective_lookahead_result,
+        )
+
+        missing = [
+            e["instance_id"]
+            for e in entries
+            if not has_objective_lookahead_result(
+                dataset_dir, e["instance_id"], split=split
+            )
+            or not (load_objective_lookahead_result(
+                dataset_dir, e["instance_id"], split=split
+            ) or {}).get("scores")
+        ]
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
+            raise SystemExit(
+                f"划分 {split} 缺少 objective look-ahead 缓存"
+                f"（如 {preview}{more}）。\n"
+                f"请先运行: python -m examples.build_objective_lookahead "
+                f"--dataset-dir {dataset_dir} --split {split}\n"
+                f"或加 --rebuild-lookahead 允许在 imitation 时现算缺失项。"
+            )
+        return
+
+    from omt_branching.solver.lookahead import LookaheadConfig
+    from omt_branching.solver.lookahead_cache import (
+        has_lookahead_result,
+        load_lookahead_result,
+    )
+
+    cfg = LookaheadConfig()
+    missing = []
+    for e in entries:
+        iid = e["instance_id"]
+        if not has_lookahead_result(dataset_dir, iid, split=split):
+            missing.append(iid)
+            continue
+        cached = load_lookahead_result(
+            dataset_dir,
+            iid,
+            split=split,
+            max_atoms=cfg.max_atoms,
+            eps=cfg.eps,
+        )
+        if cached is None or not cached.get("scores"):
+            missing.append(iid)
+    if missing:
+        preview = ", ".join(missing[:5])
+        more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
+        raise SystemExit(
+            f"划分 {split} 缺少可用的 split look-ahead 缓存"
+            f"（如 {preview}{more}；含配置不匹配）。\n"
+            f"请先运行: python -m examples.build_lookahead_cache "
+            f"--dataset-dir {dataset_dir} --split {split}\n"
+            f"或加 --rebuild-lookahead 允许在 imitation 时现算缺失项。"
+        )
+
+
 def _make_eval_decider_factory(
     policy: BranchingPolicy,
     device: str,
@@ -384,6 +454,11 @@ def main() -> None:
         default="split",
         help="imitation 教师类型：split=传播强度 look-ahead；objective=目标值 look-ahead",
     )
+    ap.add_argument(
+        "--rebuild-lookahead",
+        action="store_true",
+        help="imitation 时若缺 look-ahead 缓存则现算并写入；默认只读已有缓存",
+    )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument(
         "--rl-iters",
@@ -522,6 +597,11 @@ def main() -> None:
         paths = _smt2_abs_paths(dataset_dir, train_entries)
         ids = [e["instance_id"] for e in train_entries]
         la_kind = args.imitation_lookahead
+        rebuild = bool(args.rebuild_lookahead)
+        if not rebuild:
+            _require_imitation_lookahead_cache(
+                dataset_dir, "train", train_entries, kind=la_kind
+            )
         if la_kind == "objective":
             from examples.build_objective_lookahead import (
                 build_objective_lookahead_examples_from_smt2_parallel,
@@ -543,8 +623,9 @@ def main() -> None:
                     except Exception:
                         opt_values.append(None)
             print(
-                f"objective look-ahead 标签构建: {len(paths)} 实例(from smt2), "
-                f"workers={lookahead_workers}（优先读 lookahead_objective/ 缓存）"
+                f"objective look-ahead 标签: {len(paths)} 实例, "
+                f"workers={lookahead_workers}, "
+                f"{'可现算缺失' if rebuild else '只读 lookahead_objective/ 缓存'}"
             )
             raw_exs = build_objective_lookahead_examples_from_smt2_parallel(
                 paths,
@@ -553,6 +634,7 @@ def main() -> None:
                 dataset_dir=dataset_dir,
                 split="train",
                 use_cache=True,
+                cache_only=not rebuild,
                 z3_path=z3_path,
                 opt_values=opt_values,
             )
@@ -562,8 +644,9 @@ def main() -> None:
             )
 
             print(
-                f"split look-ahead 标签构建: {len(paths)} 实例(from smt2), "
-                f"workers={lookahead_workers}（优先读 lookahead/ 缓存）"
+                f"split look-ahead 标签: {len(paths)} 实例, "
+                f"workers={lookahead_workers}, "
+                f"{'可现算缺失' if rebuild else '只读 lookahead/ 缓存'}"
             )
             raw_exs = build_lookahead_examples_from_smt2_parallel(
                 paths,
@@ -572,6 +655,7 @@ def main() -> None:
                 dataset_dir=dataset_dir,
                 split="train",
                 use_cache=True,
+                cache_only=not rebuild,
             )
         exs = [e for e in raw_exs if e.bool_target_scores]
         hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(

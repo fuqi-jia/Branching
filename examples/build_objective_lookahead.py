@@ -304,6 +304,7 @@ def _compute_and_maybe_cache(
     dataset_dir: str | None = None,
     split: str | None = None,
     use_cache: bool = True,
+    cache_only: bool = False,
     z3_path: str | None = None,
     opt_value=None,
     timeout_s: int = 120,
@@ -316,6 +317,11 @@ def _compute_and_maybe_cache(
             return build_objective_lookahead_example(
                 inst, scores_phases=(cached["scores"], cached["phases"])
             )
+        if cache_only:
+            return None
+
+    if cache_only:
+        return None
 
     scores, phases, opt, n = objective_lookahead_scores(
         inst, z3_path=z3_path, opt_value=opt_value, timeout_s=timeout_s
@@ -343,6 +349,7 @@ def _from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None]:
         dataset_dir,
         split,
         use_cache,
+        cache_only,
         z3_path,
         timeout_s,
         opt_value_str,
@@ -354,6 +361,7 @@ def _from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None]:
         dataset_dir=dataset_dir,
         split=split,
         use_cache=use_cache,
+        cache_only=cache_only,
         z3_path=z3_path,
         opt_value=opt,
         timeout_s=timeout_s,
@@ -368,11 +376,15 @@ def build_objective_lookahead_examples_from_smt2_parallel(
     dataset_dir: str | None = None,
     split: str | None = None,
     use_cache: bool = True,
+    cache_only: bool = False,
     z3_path: str | None = None,
     opt_values: list | None = None,
     timeout_s: int = 120,
 ) -> list[RankingExample]:
-    """从已落盘 ``.smt2`` 并行构造目标值 look-ahead imitation 样本。"""
+    """从已落盘 ``.smt2`` 并行构造目标值 look-ahead imitation 样本。
+
+    ``cache_only=True`` 时只读缓存，缺失则跳过该实例（不现算）。
+    """
     if not smt2_paths:
         return []
     ids = instance_ids or [None] * len(smt2_paths)
@@ -391,6 +403,7 @@ def build_objective_lookahead_examples_from_smt2_parallel(
                 dataset_dir=dataset_dir,
                 split=split,
                 use_cache=use_cache,
+                cache_only=cache_only,
                 z3_path=z3_path,
                 opt_value=ov,
                 timeout_s=timeout_s,
@@ -409,6 +422,7 @@ def build_objective_lookahead_examples_from_smt2_parallel(
             dataset_dir,
             split,
             use_cache,
+            cache_only,
             z3_path,
             timeout_s,
             None if opts[i] is None else str(opts[i]),
